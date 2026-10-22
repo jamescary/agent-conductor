@@ -1,0 +1,1094 @@
+#!/usr/bin/env bash
+# agent-conductor CLI: scaffold runs, start the conductor and lane agents in Herdr,
+# create ticket worktrees, serialize a dev-server port, and report lane state.
+# Requires bash >= 3.2, git, jq; herdr for start/launch-lane/prompt-lane/watch/status.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# basics
+
+die() {
+  printf 'conductor: %s\n' "$*" >&2
+  if [ -n "${DIE_HINT:-}" ]; then printf 'conductor: %s\n' "$DIE_HINT" >&2; fi
+  exit 1
+}
+warn() { printf 'conductor: warning: %s\n' "$*" >&2; }
+usage_err() {
+  printf 'conductor: %s\n' "$*" >&2
+  printf 'conductor: run "conductor help" for usage\n' >&2
+  exit 2
+}
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found in PATH"; }
+need_val() { [ $# -ge 2 ] || usage_err "$1 needs a value"; }
+utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+resolve_home() {
+  local src dir
+  src=${BASH_SOURCE[0]}
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src="$dir/$src" ;; esac
+  done
+  CONDUCTOR_HOME=$(cd -P "$(dirname "$src")/.." && pwd)
+}
+resolve_home
+
+default_runs_dir() { printf '%s' "${CONDUCTOR_RUNS_DIR:-$CONDUCTOR_HOME/runs}"; }
+
+usage() {
+  cat <<'EOF'
+usage: conductor <command> [args]
+
+<run> is a run name (under $CONDUCTOR_RUNS_DIR, default <conductor-home>/runs)
+or a path to a directory containing run.env.
+
+commands:
+  new <name> --repo <path> [--kind <herdr-kind>] [--base <ref>] [--runs-dir <dir>]
+      Scaffold a run dir from templates/run, render placeholders, fill run.env.
+  start <run> [--pane <id>] [--kind <k>] [--prompt-only]
+      Start the conductor agent <run-name>-conductor in Herdr, then prompt it
+      the same way prompt-lane does (settle, send once, confirm a turn started).
+      --prompt-only skips pane and agent creation and only prompts the existing
+      conductor agent (exit 1 if it is gone or never settles). Exit 4: the agent
+      started but never became ready; no prompt is sent; handle it, then run
+      start --prompt-only. Exit 5: prompt sent but no turn confirmed; it is
+      never resent: press Enter if the text sits unsent in the input box, else
+      re-run start --prompt-only.
+  launch-lane <run> <LANE> [--branch <b>] [--base <ref>] [--kind <k>] [--args "<a>"]
+      Create a Herdr worktree workspace for a lane, copy COPY_FILES, run
+      INSTALL_CMD, start the lane agent, append out/lanes.tsv, prompt it.
+      Exit 4: the agent started but never became ready (e.g. a first-start
+      dialog); the row is appended, no prompt is sent; handle it, then run
+      prompt-lane. Exit 5: see prompt-lane.
+  prompt-lane <run> <LANE>
+      Send the standard lane prompt to the lane's agent (last lanes.tsv row)
+      once it is idle or done on two checks ~2s apart (within 30s; a brief
+      working/blocked state is waited out), then confirm a turn started
+      (within 45s). Refuses (exit 1) if the agent is gone or never settles.
+      Exit 5: prompt sent but no turn confirmed; it is never resent
+      automatically: inspect the pane, press Enter if the text sits unsent in
+      the input box, else re-run prompt-lane.
+  worktree <run> <TICKET> --branch <b> [--base <ref>]
+      Create <run>/wt/<TICKET> on a new local branch; copy COPY_FILES; run
+      INSTALL_CMD; print the worktree path last.
+  slot <run> acquire <owner> [timeout_s] | release <owner> | status | force-release
+      Machine-global lock for $DEV_PORT (exit 3 if the port already has a listener).
+  watch <run> [max_seconds] [--ignore L1,L2]
+      Poll lane agents until one settles (blocked, done, unknown, gone, or idle
+      after a state change since watch start; default max 1800s), then report.
+  status <run>
+      Lane agent states, STATUS.md mtimes, slot owner, port listeners.
+  verify <run> <LANE> <TICKET> <base> [--gates]
+      Report a ticket worktree's git state and outputs; --gates runs $GATES.
+  help
+      Show this text.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# run loading
+
+load_run() {
+  local arg=$1 dir runs missing
+  [ -n "$arg" ] || usage_err "missing <run>"
+  runs=$(default_runs_dir)
+  case $arg in
+    */* | . | ..) dir=$arg ;;
+    *)
+      if [ -f "$runs/$arg/run.env" ]; then
+        dir="$runs/$arg"
+      elif [ -f "$arg/run.env" ]; then
+        dir=$arg
+      else
+        dir="$runs/$arg"
+      fi
+      ;;
+  esac
+  [ -f "$dir/run.env" ] || die "run not found: $arg (no run.env in $dir)"
+  RUN=$(cd -P "$dir" && pwd)
+  unset RUN_NAME REPO BASE_REF AGENT_KIND AGENT_ARGS CONDUCTOR_KIND CONDUCTOR_ARGS \
+    INSTALL_CMD GATES DEV_CMD DEV_PORT DEV_READY_REGEX COPY_FILES LANE_ENV_FILE
+  set +u
+  # shellcheck source=/dev/null
+  . "$RUN/run.env" || die "failed to load $RUN/run.env"
+  set -u
+  RUN_NAME=${RUN_NAME:-}
+  REPO=${REPO:-}
+  AGENT_KIND=${AGENT_KIND:-}
+  BASE_REF=${BASE_REF:-origin/main}
+  AGENT_ARGS=${AGENT_ARGS:-}
+  CONDUCTOR_KIND=${CONDUCTOR_KIND:-}
+  CONDUCTOR_ARGS=${CONDUCTOR_ARGS:-}
+  INSTALL_CMD=${INSTALL_CMD:-}
+  GATES=${GATES:-}
+  DEV_PORT=${DEV_PORT:-}
+  COPY_FILES=${COPY_FILES:-}
+  LANE_ENV_FILE=${LANE_ENV_FILE:-}
+  missing=""
+  [ -n "$RUN_NAME" ] || missing="$missing RUN_NAME"
+  [ -n "$REPO" ] || missing="$missing REPO"
+  [ -n "$AGENT_KIND" ] || missing="$missing AGENT_KIND"
+  [ -z "$missing" ] || die "$RUN/run.env is missing required keys:$missing"
+  [ -d "$REPO" ] || die "REPO does not exist: $REPO"
+  LANES_TSV="$RUN/out/lanes.tsv"
+}
+
+check_env_file() {
+  [ -n "$LANE_ENV_FILE" ] || return 0
+  case $LANE_ENV_FILE in /*) ;; *) die "LANE_ENV_FILE must be an absolute path" ;; esac
+  [ -r "$LANE_ENV_FILE" ] || die "LANE_ENV_FILE is not readable: $LANE_ENV_FILE"
+}
+
+# Export LANE_ENV_FILE into the current shell (call in a subshell).
+load_env_file() {
+  [ -n "$LANE_ENV_FILE" ] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  . "$LANE_ENV_FILE"
+  set +a
+}
+
+valid_lane() {
+  case $1 in "" | *[!A-Za-z0-9]*) usage_err "invalid LANE id '$1' (expected [A-Za-z0-9]+)" ;; esac
+}
+valid_ticket() {
+  case $1 in "" | . | .. | -* | *[!A-Za-z0-9._-]*) usage_err "invalid TICKET '$1' (expected [A-Za-z0-9._-]+)" ;; esac
+}
+
+# herdr agent name: lowercase, chars outside [a-z0-9-] -> '-'
+agent_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g'
+}
+
+# ---------------------------------------------------------------------------
+# git + files
+
+branch_exists() { git -C "$REPO" show-ref --verify --quiet "refs/heads/$1"; }
+
+check_base() {
+  git -C "$REPO" rev-parse --verify --quiet "$1^{commit}" >/dev/null ||
+    die "unknown base ref '$1' in $REPO (fetch first?)"
+}
+
+# copy COPY_FILES from $REPO into worktree $1
+copy_files() {
+  local dest=$1 f
+  local -a files
+  [ -n "$COPY_FILES" ] || return 0
+  read -r -a files <<<"$COPY_FILES"
+  for f in ${files[@]+"${files[@]}"}; do
+    case $f in
+      /* | .. | ../* | */../* | */..) warn "COPY_FILES entry must be repo-relative, skipped: $f"; continue ;;
+    esac
+    if [ ! -e "$REPO/$f" ]; then
+      warn "COPY_FILES source missing, skipped: $REPO/$f"
+      continue
+    fi
+    mkdir -p "$(dirname "$dest/$f")"
+    rm -rf "${dest:?}/$f"
+    cp -Rp "$REPO/$f" "$dest/$f"
+    printf 'copied %s\n' "$f"
+  done
+}
+
+# run INSTALL_CMD in dir $1, output to log $2
+run_install() {
+  local dir=$1 log=$2 rc=0
+  [ -n "$INSTALL_CMD" ] || return 0
+  mkdir -p "$(dirname "$log")"
+  printf 'install: running INSTALL_CMD in %s (log: %s)\n' "$dir" "$log"
+  (cd "$dir" && load_env_file && bash -c "$INSTALL_CMD") >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    tail -n 20 "$log" >&2 || true
+    die "INSTALL_CMD failed (exit $rc); log: $log"
+  fi
+  printf 'install: ok\n'
+}
+
+# ---------------------------------------------------------------------------
+# herdr
+
+herdr_preflight() {
+  need jq
+  command -v herdr >/dev/null 2>&1 || die "herdr not found in PATH"
+  if [ "${HERDR_ENV:-}" != 1 ]; then
+    herdr agent list >/dev/null 2>&1 || die "herdr is not reachable; run inside Herdr or start its server"
+  fi
+}
+
+agents_json() {
+  local out
+  out=$(herdr agent list) || die "herdr agent list failed"
+  printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || die "unexpected herdr agent list output"
+  printf '%s' "$out"
+}
+
+# agent_state <agents-json> <name> -> idle|working|blocked|done|unknown|gone
+agent_state() {
+  printf '%s' "$1" | jq -r --arg n "$2" \
+    '[.result.agents[]? | select(.name == $n) | (.agent_status // "unknown")][0] // "gone"'
+}
+
+# agent_seq <agents-json> <name> -> its state_change_seq, or empty when missing
+agent_seq() {
+  printf '%s' "$1" | jq -r --arg n "$2" \
+    '[.result.agents[]? | select(.name == $n) | (.state_change_seq // "" | tostring)][0] // ""'
+}
+
+split_pane() {
+  local cwd=$1 out id
+  if [ -n "${HERDR_PANE_ID:-}" ]; then
+    out=$(herdr pane split --current --direction right --cwd "$cwd" --no-focus) || die "herdr pane split failed"
+  else
+    out=$(herdr pane split --direction right --cwd "$cwd" --no-focus) || die "herdr pane split failed"
+  fi
+  id=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty')
+  [ -n "$id" ] || die "could not read pane id from herdr pane split output"
+  printf '%s' "$id"
+}
+
+# start_agent <name> <kind> <pane> <args-string>; retries while the pane is not at a prompt.
+# Sets START_STATE to "ready", or to the agent's state when it started but is not
+# ready for a prompt (for example blocked on a first-start dialog). Dies if it never starts.
+start_agent() {
+  local name=$1 kind=$2 pane=$3 args=$4 attempt=1 out state
+  local -a argv cmd
+  START_STATE=""
+  read -r -a argv <<<"$args"
+  cmd=(herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout 60000)
+  if [ ${#argv[@]} -gt 0 ]; then cmd+=(-- "${argv[@]}"); fi
+  while :; do
+    if out=$("${cmd[@]}" 2>&1); then
+      START_STATE=ready
+      return 0
+    fi
+    state=$(agent_state "$(agents_json)" "$name")
+    if [ "$state" != gone ]; then
+      warn "agent $name started but is not ready ($state); waiting"
+      herdr agent wait "$name" --timeout 120000 >/dev/null 2>&1 || true
+      state=$(agent_state "$(agents_json)" "$name")
+      case $state in
+        idle | done) START_STATE=ready ;;
+        *) START_STATE=$state ;;
+      esac
+      return 0
+    fi
+    [ "$attempt" -lt 4 ] || die "herdr agent start $name failed after $attempt attempts: $out"
+    attempt=$((attempt + 1))
+    sleep 3
+  done
+}
+
+agent_read_cmd() { printf 'herdr agent read %s --source recent-unwrapped --lines 40' "$1"; }
+
+prompt_agent() {
+  herdr agent prompt "$1" "$2" >/dev/null || die "herdr agent prompt $1 failed"
+}
+
+# ---------------------------------------------------------------------------
+# rendering
+
+# render_file <file> <mode>; mode "dq" escapes values for a double-quoted shell string
+render_file() {
+  local f=$1 mode=$2 tmp
+  tmp="$f.conductor-tmp"
+  R_MODE=$mode awk '
+    function dq(s,  o, i, c) {
+      o = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" || c == "\"" || c == "$" || c == "`") o = o "\\"
+        o = o c
+      }
+      return o
+    }
+    BEGIN {
+      n = split("RUN RUN_NAME CONDUCTOR_HOME REPO AGENT_KIND BASE_REF", k, " ")
+      for (i = 1; i <= n; i++) {
+        key[i] = "{{" k[i] "}}"
+        val[i] = ENVIRON["R_" k[i]]
+        if (ENVIRON["R_MODE"] == "dq") val[i] = dq(val[i])
+      }
+    }
+    {
+      line = $0; out = ""
+      while ((p = index(line, "{{")) > 0) {
+        out = out substr(line, 1, p - 1)
+        rest = substr(line, p)
+        hit = 0
+        for (i = 1; i <= n; i++) {
+          if (substr(rest, 1, length(key[i])) == key[i]) {
+            out = out val[i]
+            line = substr(rest, length(key[i]) + 1)
+            hit = 1
+            break
+          }
+        }
+        if (!hit) { out = out "{{"; line = substr(rest, 3) }
+      }
+      print out line
+    }' "$f" >"$tmp"
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+
+# set RUN_NAME/REPO/AGENT_KIND/BASE_REF lines in run.env from SET_* env vars
+set_run_env_keys() {
+  local f=$1 tmp
+  tmp="$f.conductor-tmp"
+  [ -f "$f" ] || : >"$f"
+  awk '
+    function dq(s,  o, i, c) {
+      o = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" || c == "\"" || c == "$" || c == "`") o = o "\\"
+        o = o c
+      }
+      return o
+    }
+    BEGIN { n = split("RUN_NAME REPO AGENT_KIND BASE_REF", k, " ") }
+    {
+      for (i = 1; i <= n; i++) {
+        if (index($0, k[i] "=") == 1) {
+          print k[i] "=\"" dq(ENVIRON["SET_" k[i]]) "\""
+          done[i] = 1
+          next
+        }
+      }
+      print
+    }
+    END {
+      for (i = 1; i <= n; i++)
+        if (!done[i]) print k[i] "=\"" dq(ENVIRON["SET_" k[i]]) "\""
+    }' "$f" >"$tmp"
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# commands
+
+cmd_new() {
+  local name="" repo="" kind="" base="" runs="" top tpl dir f mode start_ref
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --repo) need_val "$@"; repo=$2; shift 2 ;;
+      --kind) need_val "$@"; kind=$2; shift 2 ;;
+      --base) need_val "$@"; base=$2; shift 2 ;;
+      --runs-dir) need_val "$@"; runs=$2; shift 2 ;;
+      -*) usage_err "new: unknown option $1" ;;
+      *)
+        [ -z "$name" ] || usage_err "new: unexpected argument $1"
+        name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || usage_err "new: missing <name>"
+  case $name in . | .. | *[!A-Za-z0-9._-]*) usage_err "new: invalid run name '$name' (expected [A-Za-z0-9._-]+)" ;; esac
+  [ -n "$repo" ] || usage_err "new: --repo <path> is required"
+  kind=${kind:-claude}
+  case $kind in *[!A-Za-z0-9_-]*) usage_err "new: invalid --kind '$kind'" ;; esac
+  base=${base:-origin/main}
+  case $base in *[[:space:]]*) usage_err "new: invalid --base '$base'" ;; esac
+  need git
+  [ -d "$repo" ] || die "repo not found: $repo"
+  top=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || die "not a git checkout: $repo"
+  tpl="$CONDUCTOR_HOME/templates/run"
+  [ -d "$tpl" ] || die "templates not found: $tpl"
+
+  runs=${runs:-$(default_runs_dir)}
+  mkdir -p "$runs"
+  runs=$(cd -P "$runs" && pwd)
+  dir="$runs/$name"
+  [ ! -e "$dir" ] || die "run dir already exists: $dir"
+  mkdir "$dir"
+  cp -R "$tpl/." "$dir/"
+  mkdir -p "$dir/out" "$dir/wt"
+
+  export R_RUN="$dir" R_RUN_NAME="$name" R_CONDUCTOR_HOME="$CONDUCTOR_HOME" R_REPO="$top" R_AGENT_KIND="$kind" R_BASE_REF="$base"
+  while IFS= read -r -d '' f; do
+    grep -qI -F '{{' "$f" 2>/dev/null || continue
+    mode=plain
+    [ "$f" = "$dir/run.env" ] && mode=dq
+    render_file "$f" "$mode"
+  done < <(find "$dir" -type f -print0)
+  export SET_RUN_NAME="$name" SET_REPO="$top" SET_AGENT_KIND="$kind" SET_BASE_REF="$base"
+  set_run_env_keys "$dir/run.env"
+
+  if [ "$runs" = "$(default_runs_dir)" ]; then start_ref=$name; else start_ref=$dir; fi
+  cat <<EOF
+created run $name
+  dir:  $dir
+  repo: $top
+  kind: $kind   base: $base
+next:
+  1. edit $dir/run.env (AGENT_ARGS, INSTALL_CMD, GATES, DEV_CMD/DEV_PORT, COPY_FILES, LANE_ENV_FILE)
+  2. write one lane prompt per lane in $dir/lanes/ (e.g. L1-<slug>.md, see L1-example.md)
+  3. write ticket specs in $dir/specs/SPECS.md
+  4. from a Herdr pane: $CONDUCTOR_HOME/bin/conductor start $start_ref
+EOF
+}
+
+cmd_start() {
+  local runarg="" pane="" kind="" prompt_only=0 name json args rc retry
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --pane) need_val "$@"; pane=$2; shift 2 ;;
+      --kind) need_val "$@"; kind=$2; shift 2 ;;
+      --prompt-only) prompt_only=1; shift ;;
+      -*) usage_err "start: unknown option $1" ;;
+      *)
+        [ -z "$runarg" ] || usage_err "start: unexpected argument $1"
+        runarg=$1; shift ;;
+    esac
+  done
+  if [ "$prompt_only" -eq 1 ] && { [ -n "$pane" ] || [ -n "$kind" ]; }; then
+    usage_err "start: --prompt-only cannot be combined with --pane or --kind"
+  fi
+  load_run "$runarg"
+  herdr_preflight
+  [ -f "$RUN/CONDUCTOR.md" ] || die "missing $RUN/CONDUCTOR.md"
+  name="$RUN_NAME-conductor"
+  retry="conductor start $RUN --prompt-only"
+  json=$(agents_json)
+  rc=0
+  if [ "$prompt_only" -eq 1 ]; then
+    [ "$(agent_state "$json" "$name")" != gone ] ||
+      die "conductor agent $name is gone; not prompting (start it with: conductor start $RUN)"
+    pane=$(printf '%s' "$json" | jq -r --arg n "$name" '[.result.agents[]? | select(.name == $n) | (.pane_id // "")][0] // ""')
+    prompt_confirmed "$name" "${pane:-unknown}" "Read $RUN/CONDUCTOR.md and follow it exactly." conductor "$retry" "$retry" || rc=$?
+    case $rc in
+      0) ;;
+      4) die "conductor agent $name is '$SETTLE_STATE', not idle or done on two checks within 30s; not prompting. Inspect: $(agent_read_cmd "$name")" ;;
+      *) exit "$rc" ;;
+    esac
+    printf 'agent: %s\npane: %s\n' "$name" "${pane:-unknown}"
+    return 0
+  fi
+  [ "$(agent_state "$json" "$name")" = gone ] || die "herdr agent '$name' already exists (see herdr agent list)"
+  kind=${kind:-${CONDUCTOR_KIND:-$AGENT_KIND}}
+  args=$CONDUCTOR_ARGS
+  if [ -z "$args" ] && [ "$kind" = "$AGENT_KIND" ]; then args=$AGENT_ARGS; fi
+  mkdir -p "$RUN/out"
+  if [ -z "$pane" ]; then pane=$(split_pane "$REPO"); fi
+  start_agent "$name" "$kind" "$pane" "$args"
+  if [ "$START_STATE" = ready ]; then
+    DIE_HINT="conductor agent $name started in pane $pane but its prompt was not sent; retry: $retry"
+    prompt_confirmed "$name" "$pane" "Read $RUN/CONDUCTOR.md and follow it exactly." conductor "$retry" "$retry" || rc=$?
+    DIE_HINT=""
+  else
+    rc=4
+    SETTLE_STATE=$START_STATE
+  fi
+  printf 'agent: %s\npane: %s\n' "$name" "$pane"
+  case $rc in
+    0) ;;
+    4)
+      {
+        printf "conductor: agent %s is not ready ('%s') after start; conductor prompt NOT sent\n" "$name" "$SETTLE_STATE"
+        printf 'conductor: pane: %s\n' "$pane"
+        printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$name")"
+        printf 'conductor: answer any dialog, wait for idle, then: %s\n' "$retry"
+      } >&2
+      exit 4
+      ;;
+    *) exit "$rc" ;;
+  esac
+}
+
+# find_lane_file <LANE> -> the lane prompt file; also requires LANE_RULES.md
+find_lane_file() {
+  local lane=$1 f found="" count=0
+  [ -f "$RUN/LANE_RULES.md" ] || die "missing $RUN/LANE_RULES.md"
+  if [ -f "$RUN/lanes/$lane.md" ]; then
+    printf '%s' "$RUN/lanes/$lane.md"
+    return 0
+  fi
+  for f in "$RUN/lanes/$lane"-*.md; do
+    [ -f "$f" ] || continue
+    count=$((count + 1))
+    found=$f
+  done
+  [ "$count" -gt 0 ] || die "no lane file for $lane (expected $RUN/lanes/$lane.md or $lane-<slug>.md)"
+  [ "$count" -eq 1 ] || die "ambiguous lane $lane: $count files match $RUN/lanes/$lane-*.md"
+  printf '%s' "$found"
+}
+
+# lane_prompt <LANE> <lane-file> <worktree>: the standard lane prompt
+lane_prompt() {
+  printf 'Read %s/LANE_RULES.md first, then %s, and run lane %s until you can reply LANE DONE. Your lane worktree is %s.' \
+    "$RUN" "$2" "$1" "$3"
+}
+
+# settle_agent <name>: true once the agent is idle or done on two consecutive checks
+# ~2s apart within 30s; false otherwise (fails at once if it is gone). Sets
+# SETTLE_STATE to the last observed state. Callers use it with ||, which disables
+# set -e here, so herdr failures exit explicitly (agents_json already reported).
+settle_agent() {
+  local name=$1 t=0 hits=0 json
+  SETTLE_STATE=""
+  while :; do
+    json=$(agents_json) || exit 1
+    SETTLE_STATE=$(agent_state "$json" "$name")
+    case $SETTLE_STATE in
+      idle | done) hits=$((hits + 1)) ;;
+      gone) return 1 ;;
+      *) hits=0 ;;
+    esac
+    [ "$hits" -lt 2 ] || return 0
+    [ "$t" -lt 30 ] || return 1
+    sleep 2
+    t=$((t + 2))
+  done
+}
+
+# prompt_confirmed <agent> <pane> <prompt> <label> <retry-cmd> <rerun>: settle,
+# send the prompt once, then confirm a turn started (state working or
+# state_change_seq moved). A successful submission does not prove the agent took
+# it, and the prompt is never resent automatically. <label> names the target in
+# messages ("lane L1", "conductor"; its first word names the prompt); <retry-cmd>
+# is the full command printed for an empty input box; <rerun> is the command
+# named in the hint shown if herdr fails after the send.
+# Returns 0 when the turn started; 4 when the agent never settled (prompt not
+# sent, SETTLE_STATE holds its state); 5 when the prompt was sent but no turn was
+# confirmed (recovery steps printed to stderr).
+prompt_confirmed() {
+  local agent=$1 pane=$2 prompt=$3 label=$4 retry=$5 rerun=$6 t=0 json seq cur state
+  settle_agent "$agent" || return 4
+  json=$(agents_json) || exit 1
+  seq=$(agent_seq "$json" "$agent")
+  prompt_agent "$agent" "$prompt"
+  DIE_HINT="the ${label%% *} prompt was already sent to $agent; inspect $(agent_read_cmd "$agent") before re-running $rerun"
+  while :; do
+    sleep 2
+    t=$((t + 2))
+    json=$(agents_json) || exit 1
+    state=$(agent_state "$json" "$agent")
+    cur=$(agent_seq "$json" "$agent")
+    if [ "$state" = working ] || { [ -n "$cur" ] && [ "$cur" != "$seq" ]; }; then
+      printf 'prompted %s: agent %s, turn started\n' "$label" "$agent"
+      return 0
+    fi
+    if [ "$state" = gone ] || [ "$t" -ge 45 ]; then break; fi
+  done
+  {
+    printf "conductor: %s: prompt sent to agent %s but no turn started within 45s (state '%s'); not resending\n" "$label" "$agent" "$state"
+    printf 'conductor: pane: %s\n' "$pane"
+    printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$agent")"
+    printf 'conductor: if the prompt text sits unsent in the input box, press Enter: herdr agent send-keys %s enter\n' "$agent"
+    printf 'conductor: if the input box is empty, re-run: %s\n' "$retry"
+  } >&2
+  return 5
+}
+
+# prompt_lane_agent <LANE> <agent> <pane> <lane-file> <worktree>: prompt_confirmed
+# with the standard lane prompt.
+prompt_lane_agent() {
+  prompt_confirmed "$2" "$3" "$(lane_prompt "$1" "$4" "$5")" "lane $1" \
+    "conductor prompt-lane $RUN $1" prompt-lane
+}
+
+append_lane_row() {
+  if [ ! -s "$LANES_TSV" ]; then
+    printf 'lane\tagent\tkind\tworkspace\tpane\tworktree\tbranch\tbase\tstarted_utc\n' >"$LANES_TSV"
+  fi
+  printf '%s\n' "$1" >>"$LANES_TSV"
+}
+
+cmd_launch_lane() {
+  local runarg="" lane="" branch="" base="" kind="" args="" args_set=0
+  local lane_file name json out ws pane wt lane_out row pane_cmd rc
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --branch) need_val "$@"; branch=$2; shift 2 ;;
+      --base) need_val "$@"; base=$2; shift 2 ;;
+      --kind) need_val "$@"; kind=$2; shift 2 ;;
+      --args) need_val "$@"; args=$2; args_set=1; shift 2 ;;
+      -*) usage_err "launch-lane: unknown option $1" ;;
+      *)
+        if [ -z "$runarg" ]; then runarg=$1
+        elif [ -z "$lane" ]; then lane=$1
+        else usage_err "launch-lane: unexpected argument $1"; fi
+        shift ;;
+    esac
+  done
+  if [ -z "$runarg" ] || [ -z "$lane" ]; then
+    usage_err "launch-lane: usage: conductor launch-lane <run> <LANE> [--branch <b>] [--base <ref>] [--kind <k>] [--args \"<a>\"]"
+  fi
+  valid_lane "$lane"
+  load_run "$runarg"
+  herdr_preflight
+  need git
+  lane_file=$(find_lane_file "$lane")
+  name=$(agent_name "$RUN_NAME-$lane")
+  json=$(agents_json)
+  [ "$(agent_state "$json" "$name")" = gone ] || die "herdr agent '$name' already exists (see herdr agent list)"
+
+  branch=${branch:-lane/$lane}
+  base=${base:-$BASE_REF}
+  kind=${kind:-$AGENT_KIND}
+  if [ "$args_set" -eq 0 ]; then
+    if [ "$kind" = "$AGENT_KIND" ]; then
+      args=$AGENT_ARGS
+    else
+      warn "--kind $kind differs from AGENT_KIND; AGENT_ARGS not applied (pass --args)"
+    fi
+  fi
+  branch_exists "$branch" && die "branch already exists in $REPO: $branch"
+  check_base "$base"
+  check_env_file
+  if [ -n "$LANE_ENV_FILE" ]; then
+    case $LANE_ENV_FILE in *"'"* | *\\*) die "LANE_ENV_FILE path must not contain quotes or backslashes" ;; esac
+  fi
+
+  out=$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$base" --label "$name" --no-focus) ||
+    die "herdr worktree create failed for branch $branch"
+  ws=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty')
+  pane=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty')
+  wt=$(printf '%s' "$out" | jq -r '.result.worktree.path // empty')
+  if [ -z "$ws" ] || [ -z "$pane" ] || [ -z "$wt" ]; then
+    die "could not read workspace/pane/path from herdr worktree create output"
+  fi
+  DIE_HINT="lane $lane left partially set up: workspace $ws, pane $pane, worktree $wt, branch $branch"
+  printf 'workspace: %s  pane: %s\nworktree: %s\n' "$ws" "$pane" "$wt"
+
+  lane_out="$RUN/out/$lane"
+  mkdir -p "$lane_out"
+  copy_files "$wt"
+  run_install "$wt" "$lane_out/install.log"
+
+  if [ -n "$LANE_ENV_FILE" ]; then
+    # Replace the pane shell with an interactive $SHELL that inherited the exported env.
+    # Works when the pane runs fish, zsh, or bash: only single quotes are used.
+    pane_cmd="exec bash -c 'set -a; . \"\$1\"; set +a; exec \"\${SHELL:-/bin/sh}\" -i' conductor-lane-env '$LANE_ENV_FILE'"
+    herdr pane run "$pane" "$pane_cmd" >/dev/null || die "herdr pane run failed (loading LANE_ENV_FILE)"
+    sleep 2
+    printf 'env: LANE_ENV_FILE exported into pane shell\n'
+  fi
+
+  start_agent "$name" "$kind" "$pane" "$args"
+  DIE_HINT=""
+  row=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$lane" "$name" "$kind" "$ws" "$pane" "$wt" "$branch" "$base" "$(utc_now)")
+  append_lane_row "$row"
+  rc=0
+  if [ "$START_STATE" = ready ]; then
+    DIE_HINT="lane $lane is in $LANES_TSV but its prompt was not sent; retry: conductor prompt-lane $RUN $lane"
+    prompt_lane_agent "$lane" "$name" "$pane" "$lane_file" "$wt" || rc=$?
+    DIE_HINT=""
+  else
+    rc=4
+    SETTLE_STATE=$START_STATE
+  fi
+  printf '%s\n' "$row"
+  case $rc in
+    0) ;;
+    4)
+      {
+        printf "conductor: agent %s is not ready ('%s') after start; lane prompt NOT sent (row added to %s)\n" "$name" "$SETTLE_STATE" "$LANES_TSV"
+        printf 'conductor: pane: %s\n' "$pane"
+        printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$name")"
+        printf 'conductor: answer any dialog, wait for idle, then: conductor prompt-lane %s %s\n' "$RUN" "$lane"
+      } >&2
+      exit 4
+      ;;
+    *) exit "$rc" ;;
+  esac
+}
+
+cmd_prompt_lane() {
+  local runarg=${1:-} lane=${2:-} row agent pane wt lane_file json rc
+  [ $# -eq 2 ] || usage_err "prompt-lane: usage: conductor prompt-lane <run> <LANE>"
+  valid_lane "$lane"
+  load_run "$runarg"
+  herdr_preflight
+  [ -s "$LANES_TSV" ] || die "no lanes launched yet ($LANES_TSV missing)"
+  row=$(awk -F '\t' -v l="$lane" 'NR > 1 && $1 == l { r = $0 } END { if (r != "") print r }' "$LANES_TSV")
+  [ -n "$row" ] || die "lane $lane has no row in $LANES_TSV (launch it with conductor launch-lane)"
+  IFS=$'\t' read -r _ agent _ _ pane wt _ <<<"$row"
+  if [ -z "$agent" ] || [ -z "$wt" ]; then die "malformed $LANES_TSV row for lane $lane"; fi
+  lane_file=$(find_lane_file "$lane")
+  # Only gone is refused up front: a brief working/blocked right after a dialog
+  # keypress is absorbed by the settle step in prompt_lane_agent.
+  json=$(agents_json)
+  [ "$(agent_state "$json" "$agent")" != gone ] || die "agent $agent for lane $lane is gone; not prompting"
+  rc=0
+  prompt_lane_agent "$lane" "$agent" "$pane" "$lane_file" "$wt" || rc=$?
+  case $rc in
+    0) ;;
+    4) die "agent $agent for lane $lane is '$SETTLE_STATE', not idle or done on two checks within 30s; not prompting. Inspect: $(agent_read_cmd "$agent")" ;;
+    *) exit "$rc" ;;
+  esac
+}
+
+cmd_worktree() {
+  local runarg="" ticket="" branch="" base="" wt
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --branch) need_val "$@"; branch=$2; shift 2 ;;
+      --base) need_val "$@"; base=$2; shift 2 ;;
+      -*) usage_err "worktree: unknown option $1" ;;
+      *)
+        if [ -z "$runarg" ]; then runarg=$1
+        elif [ -z "$ticket" ]; then ticket=$1
+        else usage_err "worktree: unexpected argument $1"; fi
+        shift ;;
+    esac
+  done
+  if [ -z "$runarg" ] || [ -z "$ticket" ] || [ -z "$branch" ]; then
+    usage_err "worktree: usage: conductor worktree <run> <TICKET> --branch <b> --base <ref>"
+  fi
+  valid_ticket "$ticket"
+  load_run "$runarg"
+  need git
+  base=${base:-$BASE_REF}
+  wt="$RUN/wt/$ticket"
+  [ ! -e "$wt" ] || die "worktree dir already exists: $wt"
+  branch_exists "$branch" && die "branch already exists in $REPO: $branch"
+  check_base "$base"
+  check_env_file
+  mkdir -p "$RUN/wt"
+  git -C "$REPO" worktree add --no-track -b "$branch" "$wt" "$base" >&2 || die "git worktree add failed"
+  copy_files "$wt"
+  run_install "$wt" "$RUN/out/install/$ticket.log"
+  printf '%s\n' "$wt"
+}
+
+# ---------------------------------------------------------------------------
+# slot
+
+slot_lock() {
+  case $DEV_PORT in "" | *[!0-9]*) die "DEV_PORT is empty or not a number in run.env; no dev slot for this run" ;; esac
+  printf '%s/agent-conductor/locks/port-%s' "${XDG_STATE_HOME:-$HOME/.local/state}" "$DEV_PORT"
+}
+
+port_listeners() {
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnpH "sport = :$1" 2>/dev/null || true
+  else
+    warn "neither lsof nor ss found; cannot check port $1"
+  fi
+}
+
+slot_status() {
+  local lock
+  lock=$(slot_lock)
+  if [ -d "$lock" ]; then
+    cat "$lock/owner" 2>/dev/null || printf '(acquiring)\n'
+  else
+    printf 'free\n'
+  fi
+}
+
+cmd_slot() {
+  local runarg=${1:-} sub=${2:-} lock owner timeout waited=0 holder listeners
+  if [ -z "$runarg" ] || [ -z "$sub" ]; then
+    usage_err "slot: usage: conductor slot <run> acquire <owner> [timeout_s]|release <owner>|status|force-release"
+  fi
+  shift 2
+  load_run "$runarg"
+  lock=$(slot_lock)
+  case $sub in
+    acquire)
+      owner=${1:-}
+      timeout=${2:-3600}
+      case $owner in "" | *[[:space:]]*) usage_err "slot acquire: <owner> required (no spaces)" ;; esac
+      case $timeout in "" | *[!0-9]*) usage_err "slot acquire: timeout must be seconds" ;; esac
+      mkdir -p "$(dirname "$lock")"
+      until mkdir "$lock" 2>/dev/null; do
+        if [ "$waited" -ge "$timeout" ]; then
+          printf 'conductor: timeout waiting for port-%s slot; held by: %s\n' "$DEV_PORT" "$(cat "$lock/owner" 2>/dev/null || true)" >&2
+          exit 1
+        fi
+        if [ "$waited" -eq 0 ]; then
+          printf 'waiting for port-%s slot; held by: %s\n' "$DEV_PORT" "$(cat "$lock/owner" 2>/dev/null || true)" >&2
+        fi
+        sleep 10
+        waited=$((waited + 10))
+      done
+      printf '%s:%s %s\n' "$RUN_NAME" "$owner" "$(utc_now)" >"$lock/owner"
+      listeners=$(port_listeners "$DEV_PORT")
+      if [ -n "$listeners" ]; then
+        rm -rf "$lock"
+        printf 'conductor: port %s already has a listener; slot not acquired:\n%s\n' "$DEV_PORT" "$listeners" >&2
+        exit 3
+      fi
+      printf 'acquired port-%s by %s:%s\n' "$DEV_PORT" "$RUN_NAME" "$owner"
+      ;;
+    release)
+      owner=${1:-}
+      [ -n "$owner" ] || usage_err "slot release: <owner> required"
+      if [ -d "$lock" ]; then
+        holder=$(cat "$lock/owner" 2>/dev/null || true)
+        case $holder in
+          "$RUN_NAME:$owner "*) ;;
+          *)
+            printf 'conductor: slot held by someone else: %s\n' "${holder:-unknown}" >&2
+            exit 1
+            ;;
+        esac
+        rm -rf "$lock"
+        printf 'released port-%s by %s:%s\n' "$DEV_PORT" "$RUN_NAME" "$owner"
+      else
+        printf 'port-%s slot already free\n' "$DEV_PORT"
+      fi
+      ;;
+    status) slot_status ;;
+    force-release)
+      rm -rf "$lock"
+      printf 'force-released port-%s\n' "$DEV_PORT"
+      ;;
+    *) usage_err "slot: unknown subcommand $sub" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# watch / status
+
+# last row per lane from lanes.tsv, in first-launch order
+lane_rows() {
+  [ -f "$LANES_TSV" ] || return 0
+  awk -F '\t' 'NR > 1 && $1 != "" {
+      if (!($1 in last)) order[++n] = $1
+      last[$1] = $0
+    }
+    END { for (i = 1; i <= n; i++) print last[order[i]] }' "$LANES_TSV"
+}
+
+file_mtime_utc() {
+  local f=$1 e
+  if [ ! -f "$f" ]; then printf 'none'; return 0; fi
+  if stat --version >/dev/null 2>&1; then e=$(stat -c %Y "$f"); else e=$(stat -f %m "$f"); fi
+  if date --version >/dev/null 2>&1; then
+    date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ
+  else
+    date -u -r "$e" +%Y-%m-%dT%H:%M:%SZ
+  fi
+}
+
+# seq_snapshot <agents-json> -> "L1=12 L2=7 ..." for every lane in lanes.tsv
+seq_snapshot() {
+  local json=$1 lane agent snap=""
+  while IFS=$'\t' read -r lane agent _; do
+    snap="$snap $lane=$(agent_seq "$json" "$agent")"
+  done < <(lane_rows)
+  printf '%s' "$snap"
+}
+
+# seq_unchanged <agents-json> <LANE> <agent> <snapshot>: true when the agent's
+# state_change_seq is missing or equals the snapshot taken at watch start
+seq_unchanged() {
+  local cur
+  cur=$(agent_seq "$1" "$3")
+  if [ -z "$cur" ]; then return 0; fi
+  case " $4 " in *" $2=$cur "*) return 0 ;; esac
+  return 1
+}
+
+# print_report <agents-json> [watch-snapshot]; with a snapshot, idle lanes whose
+# state did not change since it was taken are flagged
+print_report() {
+  local json=$1 lane agent state listeners watching=0 snap=${2:-}
+  if [ $# -ge 2 ]; then watching=1; fi
+  printf '== %s status %s\n' "$RUN_NAME" "$(utc_now)"
+  if [ ! -s "$LANES_TSV" ]; then
+    printf 'lanes: none launched (%s missing)\n' "$LANES_TSV"
+  else
+    printf 'lanes (LANE agent state STATUS.md-mtime):\n'
+    while IFS=$'\t' read -r lane agent _; do
+      state=$(agent_state "$json" "$agent")
+      if [ "$watching" -eq 1 ] && [ "$state" = idle ] && seq_unchanged "$json" "$lane" "$agent" "$snap"; then
+        state="idle (no change since watch start)"
+      fi
+      printf '%s %s %s %s\n' "$lane" "$agent" "$state" "$(file_mtime_utc "$RUN/out/$lane/STATUS.md")"
+    done < <(lane_rows)
+  fi
+  if [ -n "$DEV_PORT" ]; then
+    printf 'slot port-%s: %s\n' "$DEV_PORT" "$(slot_status)"
+    listeners=$(port_listeners "$DEV_PORT")
+    if [ -n "$listeners" ]; then
+      printf 'port %s listeners:\n%s\n' "$DEV_PORT" "$listeners"
+    else
+      printf 'port %s listeners: none\n' "$DEV_PORT"
+    fi
+  else
+    printf 'slot: n/a (DEV_PORT unset)\n'
+  fi
+}
+
+cmd_status() {
+  local runarg=${1:-}
+  [ $# -le 1 ] || usage_err "status: usage: conductor status <run>"
+  load_run "$runarg"
+  herdr_preflight
+  print_report "$(agents_json)"
+}
+
+cmd_watch() {
+  local runarg="" max=1800 max_set=0 ignore="" t=0 json snap lane agent state settled
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --ignore) need_val "$@"; ignore=$2; shift 2 ;;
+      -*) usage_err "watch: unknown option $1" ;;
+      *)
+        if [ -z "$runarg" ]; then runarg=$1
+        elif [ "$max_set" -eq 0 ]; then
+          case $1 in *[!0-9]*) usage_err "watch: max_seconds must be a number" ;; esac
+          max=$1; max_set=1
+        else usage_err "watch: unexpected argument $1"; fi
+        shift ;;
+    esac
+  done
+  load_run "$runarg"
+  herdr_preflight
+  [ -s "$LANES_TSV" ] || die "no lanes launched yet ($LANES_TSV missing)"
+  # Snapshot state_change_seq so a lane that is still idle from before its prompt
+  # (not yet picked up) does not count as settled.
+  json=$(agents_json)
+  snap=$(seq_snapshot "$json")
+  while :; do
+    settled=""
+    while IFS=$'\t' read -r lane agent _; do
+      case ",$ignore," in *",$lane,"*) continue ;; esac
+      state=$(agent_state "$json" "$agent")
+      case $state in
+        working) ;;
+        idle)
+          if ! seq_unchanged "$json" "$lane" "$agent" "$snap"; then settled="$settled $lane=idle"; fi
+          ;;
+        *) settled="$settled $lane=$state" ;;
+      esac
+    done < <(lane_rows)
+    if [ -n "$settled" ]; then
+      printf 'watch: settled after %ss:%s\n' "$t" "$settled"
+      break
+    fi
+    if [ "$t" -ge "$max" ]; then
+      printf 'watch: max %ss reached; no watched lane settled\n' "$max"
+      break
+    fi
+    sleep 30
+    t=$((t + 30))
+    json=$(agents_json)
+  done
+  print_report "$json" "$snap"
+}
+
+# ---------------------------------------------------------------------------
+# verify
+
+cmd_verify() {
+  local runarg="" lane="" ticket="" base="" gates=0 n=0 wt d log rc dirty remote cur
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --gates) gates=1; shift ;;
+      -*) usage_err "verify: unknown option $1" ;;
+      *)
+        n=$((n + 1))
+        case $n in
+          1) runarg=$1 ;;
+          2) lane=$1 ;;
+          3) ticket=$1 ;;
+          4) base=$1 ;;
+          *) usage_err "verify: unexpected argument $1" ;;
+        esac
+        shift ;;
+    esac
+  done
+  [ "$n" -eq 4 ] || usage_err "verify: usage: conductor verify <run> <LANE> <TICKET> <base> [--gates]"
+  valid_lane "$lane"
+  valid_ticket "$ticket"
+  load_run "$runarg"
+  need git
+  wt="$RUN/wt/$ticket"
+  [ -d "$wt" ] || die "no worktree $wt"
+  d="$RUN/out/$lane/$ticket"
+
+  printf '## %s (%s) %s\n' "$ticket" "$lane" "$wt"
+  cur=$(git -C "$wt" branch --show-current 2>&1 || true)
+  printf 'branch: %s\n' "${cur:-DETACHED}"
+  printf 'head: %s\n' "$(git -C "$wt" log -1 --format='%H %s' 2>&1 || true)"
+  printf 'status line: %s\n' "$(T=$ticket awk '{
+      l = $0; sub(/^[ \t]*\|?[ \t]*/, "", l)
+      if (index(l, ENVIRON["T"]) == 1) {
+        r = substr(l, length(ENVIRON["T"]) + 1, 1)
+        if (r == "" || r !~ /[A-Za-z0-9_-]/) print
+      }
+    }' "$RUN/out/$lane/STATUS.md" 2>/dev/null || true)"
+  dirty=$(git -C "$wt" status --porcelain --untracked-files=all 2>&1 | CF=$COPY_FILES awk '
+      BEGIN { n = split(ENVIRON["CF"], cf, " ") }
+      {
+        p = substr($0, 4); skip = 0
+        for (i = 1; i <= n; i++) {
+          c = cf[i]; sub(/^\.\//, "", c); sub(/\/$/, "", c)
+          if (c != "" && (p == c || index(p, c "/") == 1)) skip = 1
+        }
+        if (!skip) print
+      }' || true)
+  if [ -n "$dirty" ]; then printf 'dirty:\n%s\n' "$dirty"; else printf 'dirty: clean\n'; fi
+  remote=$(git -C "$wt" branch -r --contains HEAD 2>/dev/null | tr -s ' \n' ' ' || true)
+  printf 'remote-contains: %s\n' "${remote:-none}"
+
+  if git -C "$wt" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+    if git -C "$wt" merge-base --is-ancestor "$base" HEAD 2>/dev/null; then
+      printf 'base %s: ancestor ok\n' "$base"
+    else
+      printf 'base %s: FAIL not ancestor\n' "$base"
+    fi
+    printf -- '--- commits %s..HEAD\n' "$base"
+    git -C "$wt" log "$base..HEAD" --format='%h %s%n%b' 2>&1 | grep -vE '^$' || true
+    printf -- '--- diff stat\n'
+    git -C "$wt" diff "$base...HEAD" --stat 2>&1 | tail -n 40 || true
+  else
+    printf 'base %s: FAIL unknown ref\n' "$base"
+  fi
+  printf -- '--- out files\n'
+  ls "$d" "$d/shots" 2>&1 || true
+
+  if [ "$gates" -eq 1 ]; then
+    printf -- '--- gates\n'
+    if [ -z "$GATES" ]; then
+      printf 'gates: GATES is empty in run.env\n'
+      return 0
+    fi
+    if [ -n "$LANE_ENV_FILE" ] && [ ! -r "$LANE_ENV_FILE" ]; then
+      warn "LANE_ENV_FILE not readable; running gates without it"
+      LANE_ENV_FILE=""
+    fi
+    mkdir -p "$d"
+    log="$d/gates.log"
+    rc=0
+    (cd "$wt" && load_env_file && bash -c "$GATES") >"$log" 2>&1 || rc=$?
+    printf 'gates exit %s (log: %s)\n' "$rc" "$log"
+    tail -n 15 "$log" || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  local sub=${1:-help}
+  [ $# -eq 0 ] || shift
+  case $sub in
+    new) cmd_new "$@" ;;
+    start) cmd_start "$@" ;;
+    launch-lane) cmd_launch_lane "$@" ;;
+    prompt-lane) cmd_prompt_lane "$@" ;;
+    worktree) cmd_worktree "$@" ;;
+    slot) cmd_slot "$@" ;;
+    watch) cmd_watch "$@" ;;
+    status) cmd_status "$@" ;;
+    verify) cmd_verify "$@" ;;
+    help | -h | --help) usage ;;
+    *)
+      printf 'conductor: unknown command: %s\n' "$sub" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

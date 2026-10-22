@@ -1,0 +1,11 @@
+# Run state: prompts, specs, worktrees, reports, locks. Created by `conductor new`.
+/runs/
+
+# Secrets never belong in this repo.
+/secrets/
+*.env
+!*.env.example
+# The run config template holds no secrets.
+!/templates/run/run.env
+
+.DS_Store
