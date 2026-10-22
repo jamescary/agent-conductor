@@ -4,6 +4,7 @@
 # Secrets never belong in this repo.
 /secrets/
 *.env
+.env.*
 !*.env.example
 # The run config template holds no secrets.
 !/templates/run/run.env

@@ -179,8 +179,13 @@ copy_files() {
   read -r -a files <<<"$COPY_FILES"
   for f in ${files[@]+"${files[@]}"}; do
     case $f in
-      /* | .. | ../* | */../* | */..) warn "COPY_FILES entry must be repo-relative, skipped: $f"; continue ;;
+      /* | .. | ../* | */../* | */.. | . | ./ | .git | .git/* | ./.git | ./.git/*)
+        warn "COPY_FILES entry must be a repo-relative gitignored path, skipped: $f"; continue ;;
     esac
+    if ! git -C "$REPO" check-ignore -q -- "$f"; then
+      warn "COPY_FILES entry is not gitignored in $REPO, skipped: $f"
+      continue
+    fi
     if [ ! -e "$REPO/$f" ]; then
       warn "COPY_FILES source missing, skipped: $REPO/$f"
       continue
