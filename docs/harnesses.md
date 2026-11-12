@@ -1,6 +1,6 @@
 # Harness setup
 
-The conductor and every lane are Herdr agents started with:
+The conductor and every lane are Herdr agents (with `BACKEND="herdr"`, the default; for `BACKEND="paseo"` see [paseo.md](paseo.md)) started with:
 
 ```bash
 herdr agent start <name> --kind <KIND> --pane <pane> -- <ARGS...>

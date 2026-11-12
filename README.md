@@ -1,6 +1,8 @@
 # agent-conductor
 
-A conductor for parallel coding agents, built on [Herdr](https://herdr.dev). It works with any coding agent Herdr can start. One **conductor** agent splits a batch of tickets into **lanes**. It starts one coding agent per lane in its own Herdr worktree workspace, watches the lanes, checks their work itself (git state, gates, screenshots, PR bodies) and writes a report. Each lane can run a different harness: Claude Code, Codex, OpenCode, omp, Gemini CLI, or any other `herdr agent start --kind`. Everything stays on your machine. Nothing is pushed, merged, deployed or written to an issue tracker. You review the local branches and open the PRs yourself.
+A conductor for parallel coding agents, built on [Herdr](https://herdr.dev) or [Paseo](https://paseo.sh). It works with any coding agent the chosen host can start. One **conductor** agent splits a batch of tickets into **lanes**. It starts one coding agent per lane in its own worktree workspace, watches the lanes, checks their work itself (git state, gates, screenshots, PR bodies) and writes a report. Each lane can run a different harness: Claude Code, Codex, OpenCode, omp, Gemini CLI, or any other `herdr agent start --kind` or Paseo provider. Everything stays on your machine. Nothing is pushed, merged, deployed or written to an issue tracker. You review the local branches and open the PRs yourself.
+
+`BACKEND` in a run's `run.env` picks the host: `herdr` (the default; agents in Herdr panes) or `paseo` (Paseo agents and workspaces, see [Paseo backend](#paseo-backend) and [docs/paseo.md](docs/paseo.md)). The diagram and most of this page use Herdr's terms; every step has a Paseo equivalent.
 
 ```mermaid
 flowchart TD
@@ -21,9 +23,11 @@ flowchart TD
 
 ## Requirements
 
-- [Herdr](https://herdr.dev) 0.9.5 or later ([source](https://github.com/herdrdev/herdr)). The conductor must run inside a Herdr pane.
+- One agent host:
+  - [Herdr](https://herdr.dev) 0.9.5 or later ([source](https://github.com/herdrdev/herdr)). The conductor must run inside a Herdr pane. Or:
+  - [Paseo](https://paseo.sh) 0.15.4 or later, with its daemon running and the `paseo` CLI on `PATH`. `conductor start` can run from any shell that reaches the daemon.
 - `git`, `jq`, `bash` (3.2 or later; the macOS system bash works), and `lsof` (or `ss` on Linux) for port checks.
-- At least one coding agent CLI that Herdr supports. See [docs/harnesses.md](docs/harnesses.md).
+- At least one coding agent CLI that Herdr supports (see [docs/harnesses.md](docs/harnesses.md)), or a Paseo provider that `paseo provider ls` reports available (see [docs/paseo.md](docs/paseo.md)).
 - macOS or Linux.
 
 ## Install
@@ -41,17 +45,18 @@ Run directories are created under `runs/` in this checkout (gitignored). Set `CO
 ## Quickstart
 
 ```bash
-conductor new my-run --repo ~/src/my-app --kind claude
+conductor new my-run --repo ~/src/my-app --kind claude                   # Herdr
+conductor new my-run --repo ~/src/my-app --backend paseo --kind claude   # Paseo
 ```
 
 This creates `runs/my-run/` with every placeholder filled in, then prints the next steps. Edit these files before you launch:
 
-1. `runs/my-run/run.env`: `GATES`, `INSTALL_CMD`, `DEV_CMD`/`DEV_PORT`/`DEV_READY_REGEX`, `COPY_FILES`, `LANE_ENV_FILE`, and `AGENT_ARGS`/`CONDUCTOR_ARGS` (permission flags and extra writable dirs for your harness; see [docs/harnesses.md](docs/harnesses.md)).
+1. `runs/my-run/run.env`: `GATES`, `INSTALL_CMD`, `DEV_CMD`/`DEV_PORT`/`DEV_READY_REGEX`, `COPY_FILES`, `LANE_ENV_FILE`, and `AGENT_ARGS`/`CONDUCTOR_ARGS` (permission flags and extra writable dirs for your harness, see [docs/harnesses.md](docs/harnesses.md); under Paseo, `paseo run` flags such as `--mode bypassPermissions`, see [docs/paseo.md](docs/paseo.md)).
 2. `runs/my-run/specs/SPECS.md`: one section per ticket with its base, branch, owned files and acceptance criteria, plus optional "Conductor notes" that override everything else.
 3. `runs/my-run/lanes/L1-example.md`: rename it, and copy it once per lane (`lanes/<LANE>-<slug>.md`). Each lane file lists the files the lane owns, its tickets in order, test data and stop conditions.
 4. `runs/my-run/CONDUCTOR.md`: fill in the Lanes table (lane, prompt file, kind, lane branch/base, tickets, dependencies).
 
-Then, from a shell inside a Herdr pane:
+Then, from a shell inside a Herdr pane (Paseo: any shell that reaches the Paseo daemon):
 
 ```bash
 conductor start my-run
@@ -106,7 +111,7 @@ runs/my-run/
     REPORT.md          final report
 ```
 
-Lane worktrees are created by `herdr worktree create`, and Herdr chooses their path. The `worktree` column of `out/lanes.tsv` records it. Lane branches default to `lane/<LANE>`.
+Lane worktrees are created by `herdr worktree create` (Paseo: `paseo workspace create --isolation worktree`, under `~/.paseo/worktrees/` by default), and the host chooses their path. The `worktree` column of `out/lanes.tsv` records it. Lane branches default to `lane/<LANE>`.
 
 ### The dev slot
 
@@ -119,27 +124,46 @@ Many web apps can only be signed into on one fixed local origin. OAuth redirect 
 - **No secrets in this repo.** `COPY_FILES` (for example `.env.local`) are copied from your main checkout into each new worktree, so the main checkout stays the source of truth. `LANE_ENV_FILE` (tokens, test-account credentials) lives outside the repo, or in the gitignored run dir, with `chmod 600`. It is exported into each lane's shell and never printed. `runs/` and `secrets/` are gitignored.
 - **`LANE_ENV_FILE` is code, not data.** `launch-lane` sources it with bash under `set -a`, so it must be valid bash (normally `KEY=value` lines), and any command in it runs as you. Its path must not contain quotes or backslashes.
 - **Permissions are your choice.** `AGENT_ARGS` and `CONDUCTOR_ARGS` decide how much each agent may do unprompted. Bypass flags remove the harness's own sandbox. The conductor's narrow approval handling is then the only fallback, and the prompt rules are instructions, not enforcement. See the safety note in [docs/harnesses.md](docs/harnesses.md#safety-note).
-- **Herdr hygiene.** Agents close only panes they created, never stop the Herdr server, and leave workspaces and worktrees open for your review.
+- **Herdr hygiene.** Agents close only panes they created, never stop the Herdr server, and leave workspaces and worktrees open for your review. Under Paseo the same rules cover terminals, agents and workspaces, and never stopping or restarting the Paseo daemon; archiving a Paseo worktree workspace deletes its worktree, so nothing archives them.
+- **Paseo stores `LANE_ENV_FILE` values.** Under Paseo, `launch-lane` passes each variable as `paseo run --env KEY=value`. Paseo keeps them in the agent's record under `~/.paseo/agents/` (`launchEnv`, in the `0700` Paseo home) until the agent is deleted, and they sit on the `paseo` command line while it runs.
 
 ### Mixing harnesses
 
 `AGENT_KIND` sets the default harness for lanes, and `CONDUCTOR_KIND` sets the conductor's. To put one lane on a different harness, write its kind and args in the Kind cell of the Lanes table in `CONDUCTOR.md`, for example `codex --args "--sandbox workspace-write --ask-for-approval on-request --add-dir /abs/run/dir …"` (the full Codex args are in [docs/harnesses.md](docs/harnesses.md#codex-cli-codex)). The conductor passes them as `conductor launch-lane <run> <LANE> --kind <k> --args "<a>"`. A lane on a non-default kind without `--args` starts with no extra args. Every harness has to reach `$RUN` and the slot lock. Per-harness flags are in [docs/harnesses.md](docs/harnesses.md).
 
+### Paseo backend
+
+With `BACKEND="paseo"` (`conductor new --backend paseo`) the same run uses Paseo instead of Herdr:
+
+| Herdr | Paseo |
+|---|---|
+| conductor in a pane split from yours (`start --pane`) | conductor in a new local Paseo workspace at `$REPO` (`start --workspace <id>` reuses one) |
+| `herdr worktree create` lane workspace | `paseo workspace create --isolation worktree --mode branch-off`, slug and title `<run-name>-<lane>` |
+| `--kind` harness + harness CLI flags in `AGENT_ARGS` | Paseo provider or `provider/model` + `paseo run` flags (`--mode`, `--thinking`) |
+| agent name `<run-name>-<lane>` | agent title `<run-name>-<lane>`, labels `agent-conductor.run=<run-name>` and `agent-conductor.role=<lane>`; `lanes.tsv` stores the agent id, pane `-` |
+| `LANE_ENV_FILE` exported into the pane shell | each variable passed as `paseo run --env` |
+| `herdr agent start` then `herdr agent prompt` (exit 4 on a startup dialog) | `paseo run` creates the agent with its prompt; no startup dialogs, no exit 4 |
+| states `working`, `idle`, `blocked`, `done`, `unknown` | `working` (running), `idle`, `blocked` (pending permission request), `error`, `closed` |
+| `herdr agent read` / `send-keys` | `paseo logs <id> --tail 40` / `paseo permit allow <id> <request>` |
+| dev server in a Herdr pane | dev server in a Paseo terminal (`paseo terminal create/send-keys/capture/kill`) |
+
+Details, mode ids per provider and caveats: [docs/paseo.md](docs/paseo.md).
+
 ## CLI reference
 
-`<run>` is a run name (resolved under `${CONDUCTOR_RUNS_DIR:-<repo>/runs}`) or a path to a directory containing `run.env`. Run names must match `[A-Za-z0-9._-]+` and can't be `.` or `..`; ticket ids follow the same rule and also can't start with `-`; `<LANE>` ids must match `[A-Za-z0-9]+`; `--kind` values may use only letters, digits, `_` and `-`.
+`<run>` is a run name (resolved under `${CONDUCTOR_RUNS_DIR:-<repo>/runs}`) or a path to a directory containing `run.env`. Run names must match `[A-Za-z0-9._-]+` and can't be `.` or `..`; ticket ids follow the same rule and also can't start with `-`; `<LANE>` ids must match `[A-Za-z0-9]+`; Herdr `--kind` values may use only letters, digits, `_` and `-` (Paseo kinds may also use `.` and `/`).
 
-`start` and `launch-lane` retry `herdr agent start` up to 4 times, 3 s apart (the new pane may not be at a shell prompt yet), and wait up to 120 s for an agent that started but isn't ready before exiting 4. Once `herdr agent prompt` has succeeded, every later failure while confirming the turn (including a failed `herdr agent list`) exits 5, never 1, with the hint that the prompt was already sent and should be inspected before re-running.
+`start` and `launch-lane` (Herdr) retry `herdr agent start` up to 4 times, 3 s apart (the new pane may not be at a shell prompt yet), and wait up to 120 s for an agent that started but isn't ready before exiting 4. Once the prompt has been sent (`herdr agent prompt`, `paseo send`, or `paseo run`, which sends it with creation), every later failure while confirming the turn (including a failed agent listing) exits 5, never 1, with the hint that the prompt was already sent and should be inspected before re-running. Under Paseo a turn counts as started when `paseo run` reports the agent running, or when the agent turns `working` or its `UpdatedAt` moves within 45 s.
 
 | Command | Purpose |
 |---|---|
-| `conductor new <name> --repo <path> [--kind <k>] [--base <ref>] [--runs-dir <dir>]` | Scaffold a run directory from `templates/run/` and fill in placeholders and `run.env`. `--kind` defaults to `claude`. Refuses if the directory exists. |
-| `conductor start <run> [--pane <id>] [--kind <k>] [--prompt-only]` | Preflight, split a pane (cwd `$REPO`) unless `--pane` is given, start the conductor agent and send it `Read <RUN>/CONDUCTOR.md and follow it exactly.`, settling first and confirming the turn started (as `prompt-lane` does). `--prompt-only` skips pane and agent creation and only prompts the existing `<run-name>-conductor` agent (exit 1 if it's gone or never settles); it can't be combined with `--pane` or `--kind`. Exits 4 if the conductor agent isn't ready after start: no prompt is sent, and it prints the pane id, a `herdr agent read` command and `conductor start <run> --prompt-only` as the next step. Exits 5 if the prompt was sent but no turn started: it never resends. Other failures exit 1. |
-| `conductor launch-lane <run> <LANE> [--branch <b>] [--base <ref>] [--kind <k>] [--args "<a>"]` | Create the lane's Herdr worktree workspace, copy `COPY_FILES`, run `INSTALL_CMD`, export `LANE_ENV_FILE`, start and prompt the lane agent, and append and print its `lanes.tsv` row. Exits 4 if the agent isn't ready after start (any state other than `idle` or `done`, usually `blocked` on a startup dialog): the row is still written, no prompt is sent, and it prints the pane id and a `herdr agent read` command. Exits 5 if the prompt was sent but no turn started (see `prompt-lane`). Other failures exit 1. |
+| `conductor new <name> --repo <path> [--backend herdr\|paseo] [--kind <k>] [--base <ref>] [--runs-dir <dir>]` | Scaffold a run directory from `templates/run/` and fill in placeholders and `run.env`. `--backend` defaults to `herdr` and keeps only that backend's instructions in the rendered files. `--kind` defaults to `claude` (a Herdr kind, or a Paseo provider or `provider/model`). Refuses if the directory exists. |
+| `conductor start <run> [--pane <id> \| --workspace <id>] [--kind <k>] [--prompt-only]` | Preflight, then start the conductor agent `<run-name>-conductor` and send it `Read <RUN>/CONDUCTOR.md and follow it exactly.`, confirming the turn started (as `prompt-lane` does). Herdr: splits a pane (cwd `$REPO`) unless `--pane` is given, starts the agent, then settles and prompts it. Paseo: creates a local Paseo workspace at `$REPO` unless `--workspace` is given, and creates the agent with the prompt. `--prompt-only` skips agent creation and only prompts the existing conductor agent (exit 1 if it's gone or never settles); it can't be combined with `--pane`, `--workspace` or `--kind`. Exits 4 (Herdr only) if the conductor agent isn't ready after start: no prompt is sent, and it prints the pane id, a `herdr agent read` command and `conductor start <run> --prompt-only` as the next step. Exits 5 if the prompt was sent but no turn started: it never resends. Other failures exit 1. |
+| `conductor launch-lane <run> <LANE> [--branch <b>] [--base <ref>] [--kind <k>] [--args "<a>"]` | Create the lane's worktree workspace (Herdr, or Paseo with slug and title `<run-name>-<lane>`), copy `COPY_FILES`, run `INSTALL_CMD`, give the agent `LANE_ENV_FILE` (Herdr: exported into the pane shell; Paseo: `paseo run --env`), start and prompt the lane agent, and append and print its `lanes.tsv` row. Exits 4 (Herdr only) if the agent isn't ready after start (any state other than `idle` or `done`, usually `blocked` on a startup dialog): the row is still written, no prompt is sent, and it prints the pane id and a `herdr agent read` command. Exits 5 if the prompt was sent but no turn started (see `prompt-lane`). Other failures exit 1. |
 | `conductor prompt-lane <run> <LANE>` | Send the standard lane prompt to the lane in the last `lanes.tsv` row for `<LANE>`, for example after answering a startup dialog. Waits up to 30 s for the agent to settle at `idle` or `done` first, then confirms the turn started (`working`, or a state change) within 45 s and prints `prompted lane <LANE>: agent <agent>, turn started`. Refuses (exit 1) if the agent is gone or doesn't settle. Exits 5 if the turn isn't confirmed: it never resends, and prints the pane id, a `herdr agent read` command and what to do next. |
 | `conductor worktree <run> <TICKET> --branch <b> [--base <ref>]` | Create the ticket worktree at `$RUN/wt/<TICKET>` on a new local branch (base defaults to `BASE_REF`), copy `COPY_FILES` and run `INSTALL_CMD`. Prints the path last. |
 | `conductor slot <run> acquire <owner> [timeout_s]` / `release <owner>` / `status` / `force-release` | Machine-global dev-slot lock for `DEV_PORT`. `acquire` waits up to `timeout_s` (default 3600) and exits 3 if the port is already in use. `status` prints `free` or the owner line. |
-| `conductor watch <run> [max_seconds] [--ignore L1,L2]` | Wait until any lane settles, or the timeout passes (default 1800 s), then print the status report. A lane settles when it is `blocked`, `done`, `unknown` or gone, or `idle` and either its `state_change_seq` changed since its baseline or it was seen `working` during this watch. The baseline is taken the first time `watch` sees the lane, so lanes appended to `lanes.tsv` mid-watch don't settle instantly. |
+| `conductor watch <run> [max_seconds] [--ignore L1,L2]` | Wait until any lane settles, or the timeout passes (default 1800 s), then print the status report. A lane settles when it is `blocked`, `done`, `unknown`, `error`, `closed` or gone, or `idle` and either its `state_change_seq` (Paseo: `UpdatedAt`) changed since its baseline or it was seen `working` during this watch. The baseline is taken the first time `watch` sees the lane, so lanes appended to `lanes.tsv` mid-watch don't settle instantly. |
 | `conductor status <run>` | Status report: each lane's agent state, the slot owner, the port listener and STATUS.md times. |
 | `conductor verify <run> <LANE> <TICKET> <base> [--gates]` | Show branch, HEAD, STATUS line, dirty files, pushed check, base ancestry, commits, diff stat and out files. `--gates` runs `$GATES` into `gates.log`. |
 | `conductor help` | Usage. |
@@ -154,7 +178,7 @@ Many web apps can only be signed into on one fixed local origin. OAuth redirect 
 
 ## Supported harnesses
 
-Any `herdr agent start --kind` value works. These have setup notes in [docs/harnesses.md](docs/harnesses.md):
+Any `herdr agent start --kind` value works under Herdr, and any available Paseo provider under Paseo ([docs/paseo.md](docs/paseo.md)). These have setup notes in [docs/harnesses.md](docs/harnesses.md):
 
 | Harness | `--kind` | Instruction file | Subagents | Image viewing |
 |---|---|---|---|---|
@@ -171,7 +195,7 @@ Any `herdr agent start --kind` value works. These have setup notes in [docs/harn
 - A lane is only useful when it can work unattended. With strict approvals, every prompt stalls the lane until the conductor answers it (only for in-scope actions) or you do. Wider permissions mean more trust in the agent and in the prompt rules.
 - There is one shared dev port per machine. Browser checks are serialized across all lanes and runs, so heavy UI work makes lanes wait for the slot.
 - The conductor and lanes are agents following long Markdown prompts. How reliably they follow them depends on the harness and model. The conductor verifies git state, gates and screenshots itself, but it can't catch everything a lane misreads.
-- Herdr's agent states (`working`, `idle`, `blocked`, `done`) drive monitoring. A harness whose state Herdr reports poorly is harder to monitor.
+- The host's agent states drive monitoring: Herdr's (`working`, `idle`, `blocked`, `done`), or Paseo's status and pending permission requests. A harness whose state the host reports poorly is harder to monitor.
 
 ## License
 

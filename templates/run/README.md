@@ -7,7 +7,12 @@ What this run does: *(one line — e.g. "TICKET-1 – TICKET-4 in my-app, two la
 - Lane agents: `{{AGENT_KIND}}`, branches from `{{BASE_REF}}` unless a lane says otherwise.
 
 ## Before launching (human)
+{{IF herdr}}
 1. Edit `run.env`: `GATES`, `INSTALL_CMD`, `DEV_CMD` / `DEV_PORT` / `DEV_READY_REGEX`, `COPY_FILES`, `AGENT_ARGS` / `CONDUCTOR_ARGS` (permission mode, extra writable dirs for `{{RUN}}` and `{{REPO}}/.git`; see the comments in `run.env`).
+{{END}}
+{{IF paseo}}
+1. Edit `run.env`: `GATES`, `INSTALL_CMD`, `DEV_CMD` / `DEV_PORT` / `DEV_READY_REGEX`, `COPY_FILES`, `AGENT_ARGS` / `CONDUCTOR_ARGS` (`paseo run` flags such as `--mode`; see the comments in `run.env`).
+{{END}}
 2. Write the ticket specs in `specs/SPECS.md`: base, branch, owned files, acceptance, and any "Conductor notes".
 3. Write one lane prompt per lane in `lanes/` (copy `lanes/L1-example.md` to `lanes/<LANE>-<slug>.md`).
 4. Fill the Lanes table in `CONDUCTOR.md` (delete the example row) and list cross-lane shared files.
@@ -16,6 +21,7 @@ What this run does: *(one line — e.g. "TICKET-1 – TICKET-4 in my-app, two la
 7. Nothing listens on `DEV_PORT` (`lsof -nP -iTCP:<port> -sTCP:LISTEN` prints nothing).
 
 ## Launch
+{{IF herdr}}
 From inside a Herdr pane:
 ```bash
 {{CONDUCTOR_HOME}}/bin/conductor start {{RUN_NAME}}
@@ -27,6 +33,18 @@ A harness's first-start dialog (folder trust) blocks an agent until answered. Fo
 Watch from the Herdr sidebar: each lane appears as its own workspace. Progress:
 - `out/CONDUCTOR.md` — conductor log;
 - `out/lanes.tsv` — one row per launched lane (agent, workspace, pane, worktree, branch);
+{{END}}
+{{IF paseo}}
+From any shell that reaches the Paseo daemon (a terminal, or ask a Paseo agent to run it):
+```bash
+{{CONDUCTOR_HOME}}/bin/conductor start {{RUN_NAME}}
+```
+(Use `{{RUN}}` instead of the name if this run lives outside the default runs dir.) It runs preflight, creates a local Paseo workspace at `{{REPO}}` (or uses `--workspace <id>`), and starts the conductor agent there with `CONDUCTOR.md` as its first prompt.
+
+Watch in the Paseo app: the conductor and each lane appear as their own workspaces, and the lanes are the conductor's subagents. Permission requests from lanes show up there and in `paseo permit ls`. Progress:
+- `out/CONDUCTOR.md` — conductor log;
+- `out/lanes.tsv` — one row per launched lane (Paseo agent id, workspace, worktree, branch);
+{{END}}
 - `out/<LANE>/STATUS.md` — one line per ticket;
 - `out/REPORT.md` — final report. The conductor finishes with `CONDUCTOR DONE {{RUN}}/out/REPORT.md`.
 
@@ -39,10 +57,18 @@ Watch from the Herdr sidebar: each lane appears as its own workspace. Progress:
 4. Push and open PRs yourself. Update your tracker from the report's human follow-ups; the run never writes to it.
 
 ## Cleanup
+{{IF herdr}}
 ```bash
 herdr worktree remove --workspace <id>             # each lane, workspace column of out/lanes.tsv
 git -C {{REPO}} worktree remove {{RUN}}/wt/<TICKET> # each ticket worktree
 ```
+{{END}}
+{{IF paseo}}
+```bash
+paseo workspace archive <id>                        # each lane (workspace column of out/lanes.tsv; deletes its worktree) and the conductor's
+git -C {{REPO}} worktree remove {{RUN}}/wt/<TICKET> # each ticket worktree
+```
+{{END}}
 
 ## Files
 - `README.md` — this file.

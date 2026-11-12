@@ -5,7 +5,7 @@ One `## <TICKET>: <title>` section per ticket; lanes find theirs with `grep -n '
 Replace the example tickets below and delete this comment.
 -->
 
-**Precedence.** For a ticket, its section here is the spec. Where it differs from the issue tracker, this file wins. A section's **Conductor notes** override everything else, including the rest of the section, the lane file, and the workflow defaults in `LANE_RULES.md`. They never relax its Hard limits (local only, secrets, test data, file ownership, Herdr hygiene). Lanes may read the issue tracker for context but never write to it.
+**Precedence.** For a ticket, its section here is the spec. Where it differs from the issue tracker, this file wins. A section's **Conductor notes** override everything else, including the rest of the section, the lane file, and the workflow defaults in `LANE_RULES.md`. They never relax its Hard limits (local only, secrets, test data, file ownership, {{BACKEND_NAME}} hygiene). Lanes may read the issue tracker for context but never write to it.
 
 Defaults for every ticket: base `{{BASE_REF}}`, gates `$GATES` from `run.env`, all work local.
 

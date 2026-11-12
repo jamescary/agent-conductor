@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# agent-conductor CLI: scaffold runs, start the conductor and lane agents in Herdr,
-# create ticket worktrees, serialize a dev-server port, and report lane state.
-# Requires bash >= 3.2, git, jq; herdr for start/launch-lane/prompt-lane/watch/status.
+# agent-conductor CLI: scaffold runs, start the conductor and lane agents in Herdr or
+# Paseo (BACKEND in run.env), create ticket worktrees, serialize a dev-server port,
+# and report lane state.
+# Requires bash >= 3.2, git, jq; herdr or paseo for start/launch-lane/prompt-lane/watch/status.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -48,41 +49,50 @@ usage: conductor <command> [args]
 <run> is a run name (under $CONDUCTOR_RUNS_DIR, default <conductor-home>/runs)
 or a path to a directory containing run.env.
 
+BACKEND in run.env picks the agent host: herdr (default) runs agents in Herdr
+panes and worktree workspaces; paseo runs them as Paseo agents in Paseo
+workspaces. Under paseo, a kind is a Paseo provider or provider/model (e.g.
+claude, codex/gpt-5.4) and args are extra `paseo run` flags (e.g. --mode
+bypassPermissions); an agent is created together with its first prompt.
+
 commands:
-  new <name> --repo <path> [--kind <herdr-kind>] [--base <ref>] [--runs-dir <dir>]
+  new <name> --repo <path> [--backend herdr|paseo] [--kind <k>] [--base <ref>] [--runs-dir <dir>]
       Scaffold a run dir from templates/run, render placeholders, fill run.env.
-  start <run> [--pane <id>] [--kind <k>] [--prompt-only]
-      Start the conductor agent <run-name>-conductor in Herdr, then prompt it
-      the same way prompt-lane does (settle, send once, confirm a turn started).
-      --prompt-only skips pane and agent creation and only prompts the existing
-      conductor agent (exit 1 if it is gone or never settles). Exit 4: the agent
-      started but never became ready; no prompt is sent; handle it, then run
-      start --prompt-only. Exit 5: prompt sent but no turn confirmed; it is
-      never resent: press Enter if the text sits unsent in the input box, else
-      re-run start --prompt-only.
+  start <run> [--pane <id> | --workspace <id>] [--kind <k>] [--prompt-only]
+      Start the conductor agent <run-name>-conductor, then prompt it the same
+      way prompt-lane does (settle, send once, confirm a turn started).
+      herdr: in a pane split from yours, or --pane. paseo: in a new local Paseo
+      workspace at $REPO, or --workspace.
+      --prompt-only skips agent creation and only prompts the existing
+      conductor agent (exit 1 if it is gone or never settles). Exit 4 (herdr):
+      the agent started but never became ready; no prompt is sent; handle it,
+      then run start --prompt-only. Exit 5: prompt sent but no turn confirmed;
+      it is never resent: inspect the agent, then re-run start --prompt-only
+      only if the prompt never arrived.
   launch-lane <run> <LANE> [--branch <b>] [--base <ref>] [--kind <k>] [--args "<a>"]
-      Create a Herdr worktree workspace for a lane, copy COPY_FILES, run
-      INSTALL_CMD, start the lane agent, append out/lanes.tsv, prompt it.
-      Exit 4: the agent started but never became ready (e.g. a first-start
-      dialog); the row is appended, no prompt is sent; handle it, then run
-      prompt-lane. Exit 5: see prompt-lane.
+      Create a worktree workspace for a lane (Herdr or Paseo), copy COPY_FILES,
+      run INSTALL_CMD, start the lane agent with LANE_ENV_FILE in its
+      environment, append out/lanes.tsv, prompt it.
+      Exit 4 (herdr): the agent started but never became ready (e.g. a
+      first-start dialog); the row is appended, no prompt is sent; handle it,
+      then run prompt-lane. Exit 5: see prompt-lane.
   prompt-lane <run> <LANE>
       Send the standard lane prompt to the lane's agent (last lanes.tsv row)
       once it is idle or done on two checks ~2s apart (within 30s; a brief
       working/blocked state is waited out), then confirm a turn started
       (within 45s). Refuses (exit 1) if the agent is gone or never settles.
       Exit 5: prompt sent but no turn confirmed; it is never resent
-      automatically: inspect the pane, press Enter if the text sits unsent in
-      the input box, else re-run prompt-lane.
+      automatically: inspect the agent (herdr: press Enter if the text sits
+      unsent in the input box), else re-run prompt-lane.
   worktree <run> <TICKET> --branch <b> [--base <ref>]
       Create <run>/wt/<TICKET> on a new local branch; copy COPY_FILES; run
       INSTALL_CMD; print the worktree path last.
   slot <run> acquire <owner> [timeout_s] | release <owner> | status | force-release
       Machine-global lock for $DEV_PORT (exit 3 if the port already has a listener).
   watch <run> [max_seconds] [--ignore L1,L2]
-      Poll lane agents until one settles (blocked, done, unknown, gone, or idle
-      after it was seen working or its state changed since watch first saw it;
-      default max 1800s), then report.
+      Poll lane agents until one settles (blocked, done, unknown, error, closed,
+      gone, or idle after it was seen working or its state changed since watch
+      first saw it; default max 1800s), then report.
   status <run>
       Lane agent states, STATUS.md mtimes, slot owner, port listeners.
   verify <run> <LANE> <TICKET> <base> [--gates]
@@ -113,7 +123,7 @@ load_run() {
   esac
   [ -f "$dir/run.env" ] || die "run not found: $arg (no run.env in $dir)"
   RUN=$(cd -P "$dir" && pwd)
-  unset RUN_NAME REPO BASE_REF AGENT_KIND AGENT_ARGS CONDUCTOR_KIND CONDUCTOR_ARGS \
+  unset RUN_NAME REPO BASE_REF BACKEND AGENT_KIND AGENT_ARGS CONDUCTOR_KIND CONDUCTOR_ARGS \
     INSTALL_CMD GATES DEV_CMD DEV_PORT DEV_READY_REGEX COPY_FILES LANE_ENV_FILE
   set +u
   # shellcheck source=/dev/null
@@ -121,6 +131,7 @@ load_run() {
   set -u
   RUN_NAME=${RUN_NAME:-}
   REPO=${REPO:-}
+  BACKEND=${BACKEND:-herdr}
   AGENT_KIND=${AGENT_KIND:-}
   BASE_REF=${BASE_REF:-origin/main}
   AGENT_ARGS=${AGENT_ARGS:-}
@@ -137,6 +148,10 @@ load_run() {
   [ -n "$AGENT_KIND" ] || missing="$missing AGENT_KIND"
   [ -z "$missing" ] || die "$RUN/run.env is missing required keys:$missing"
   [ -d "$REPO" ] || die "REPO does not exist: $REPO"
+  case $BACKEND in
+    herdr | paseo) ;;
+    *) die "BACKEND in $RUN/run.env must be herdr or paseo, not '$BACKEND'" ;;
+  esac
   LANES_TSV="$RUN/out/lanes.tsv"
 }
 
@@ -162,7 +177,7 @@ check_ticket_id() {
   case $1 in "" | . | .. | -* | *[!A-Za-z0-9._-]*) usage_err "invalid TICKET '$1' (expected [A-Za-z0-9._-]+)" ;; esac
 }
 
-# herdr agent name: lowercase, chars outside [a-z0-9-] -> '-'
+# agent name (Herdr name, Paseo title): lowercase, chars outside [a-z0-9-] -> '-'
 agent_name() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | LC_ALL=C sed 's/[^a-z0-9-]/-/g'
 }
@@ -218,27 +233,66 @@ run_install() {
 }
 
 # ---------------------------------------------------------------------------
-# herdr
+# agent backends
+#
+# BACKEND=herdr: agents live in Herdr panes; an agent's handle is its Herdr name.
+# BACKEND=paseo: agents are Paseo agents labelled $PASEO_RUN_LABEL=<RUN_NAME>; an
+# agent's handle is its Paseo agent id and its title is the name Herdr would use.
+# agents_json reports both in Herdr's shape: .result.agents[] with name (the
+# handle), title (Paseo only), agent_status, state_change_seq and pane_id.
 
-herdr_preflight() {
-  require_cmd jq
-  command -v herdr >/dev/null 2>&1 || die "herdr not found in PATH"
-  if [ "${HERDR_ENV:-}" != 1 ]; then
-    herdr agent list >/dev/null 2>&1 || die "herdr is not reachable; run inside Herdr or start its server"
-  fi
+PASEO_RUN_LABEL="agent-conductor.run"
+PASEO_ROLE_LABEL="agent-conductor.role"
+PASEO_ENV_ARGS=()
+
+backend_preflight() {
+  case $BACKEND in
+    herdr) herdr_preflight ;;
+    paseo) paseo_preflight ;;
+  esac
 }
 
 agents_json() {
-  local out
-  out=$(herdr agent list) || die "herdr agent list failed"
-  printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || die "unexpected herdr agent list output"
-  printf '%s' "$out"
+  case $BACKEND in
+    herdr) herdr_agents_json ;;
+    paseo) paseo_agents_json ;;
+  esac
 }
 
-# agent_state <agents-json> <name> -> idle|working|blocked|done|unknown|gone
+# agent_state <agents-json> <handle> -> idle|working|blocked|done|unknown|error|closed|gone
 agent_state() {
   printf '%s' "$1" | jq -r --arg n "$2" \
     '[.result.agents[]? | select(.name == $n) | (.agent_status // "unknown")][0] // "gone"'
+}
+
+# agent_lookup <agents-json> <title> -> the handle of the agent with that title
+# (Herdr: its name), or empty when there is none
+agent_lookup() {
+  printf '%s' "$1" | jq -r --arg t "$2" \
+    '[.result.agents[]? | select((.title // .name) == $t) | .name][0] // ""'
+}
+
+# agent_exists_msg <title> <handle>: the error for an agent title already in use
+agent_exists_msg() {
+  case $BACKEND in
+    herdr) printf "herdr agent '%s' already exists (see herdr agent list)" "$1" ;;
+    paseo) printf "Paseo agent '%s' already exists for run %s (id %s; archive it with: paseo archive %s)" "$1" "$RUN_NAME" "$2" "$2" ;;
+  esac
+}
+
+# send_prompt <handle> <prompt>: submit a prompt to an existing agent
+send_prompt() {
+  case $BACKEND in
+    herdr) herdr agent prompt "$1" "$2" >/dev/null ;;
+    paseo) paseo send "$1" --no-wait --json --prompt "$2" >/dev/null ;;
+  esac
+}
+
+agent_read_cmd() {
+  case $BACKEND in
+    herdr) printf 'herdr agent read %s --source recent-unwrapped --lines 40' "$1" ;;
+    paseo) printf 'paseo logs %s --tail 40' "$1" ;;
+  esac
 }
 
 # agent_seq <agents-json> <name> -> its state_change_seq, or empty when missing
@@ -266,6 +320,24 @@ resolve_harness() {
   fi
   [ "$HARNESS_KIND" = "$AGENT_KIND" ] || return 1
   HARNESS_ARGS=$AGENT_ARGS
+}
+
+# ---------------------------------------------------------------------------
+# herdr
+
+herdr_preflight() {
+  require_cmd jq
+  command -v herdr >/dev/null 2>&1 || die "herdr not found in PATH"
+  if [ "${HERDR_ENV:-}" != 1 ]; then
+    herdr agent list >/dev/null 2>&1 || die "herdr is not reachable; run inside Herdr or start its server"
+  fi
+}
+
+herdr_agents_json() {
+  local out
+  out=$(herdr agent list) || die "herdr agent list failed"
+  printf '%s' "$out" | jq -e '.result.agents' >/dev/null 2>&1 || die "unexpected herdr agent list output"
+  printf '%s' "$out"
 }
 
 split_pane() {
@@ -312,7 +384,117 @@ start_agent() {
   done
 }
 
-agent_read_cmd() { printf 'herdr agent read %s --source recent-unwrapped --lines 40' "$1"; }
+# ---------------------------------------------------------------------------
+# paseo
+
+paseo_preflight() {
+  require_cmd jq
+  command -v paseo >/dev/null 2>&1 || die "paseo not found in PATH"
+  paseo ls --json >/dev/null 2>&1 || die "the Paseo daemon is not reachable (check: paseo status)"
+}
+
+# The run's agents, from `paseo ls` (archived agents are omitted, so they read as
+# gone) and one `paseo inspect` each. A pending permission request reads as
+# blocked, running or initializing as working; idle, error and closed pass
+# through. UpdatedAt stands in for Herdr's state_change_seq: it moves while the
+# agent works and stays put while it is idle.
+paseo_agents_json() {
+  local list id rows=""
+  list=$(paseo ls -g --background --label "$PASEO_RUN_LABEL=$RUN_NAME" --json) || die "paseo ls failed"
+  printf '%s' "$list" | jq -e 'type == "array"' >/dev/null 2>&1 || die "unexpected paseo ls output"
+  while IFS= read -r id; do
+    rows="$rows$(paseo inspect "$id" --json)" || die "paseo inspect $id failed"
+  done < <(printf '%s' "$list" | jq -r '.[].id')
+  printf '%s' "$rows" | jq -s '{result: {agents: [.[] | select(.Archived != true) | {
+      name: .Id, title: .Name, pane_id: .Id, state_change_seq: (.UpdatedAt // ""),
+      agent_status: (
+        if ((.PendingPermissions // []) | length) > 0 then "blocked"
+        elif .Status == "running" or .Status == "initializing" then "working"
+        elif .Status == "idle" or .Status == "error" or .Status == "closed" then .Status
+        else "unknown" end)}]}}'
+}
+
+# paseo_create_workspace_local <title>: a new local Paseo workspace at $REPO; prints its id
+paseo_create_workspace_local() {
+  local out id
+  out=$(paseo workspace create --isolation local --path "$REPO" --title "$1" --json) ||
+    die "paseo workspace create failed for $REPO"
+  id=$(printf '%s' "$out" | jq -r '.workspaceId // empty')
+  [ -n "$id" ] || die "could not read workspaceId from paseo workspace create output"
+  printf '%s' "$id"
+}
+
+# paseo_env_args: set PASEO_ENV_ARGS to one `--env KEY=value` pair for each
+# variable LANE_ENV_FILE assigns or exports when bash sources it under set -a
+# (the way Herdr lanes get it). The lane agent is spawned by the daemon, not by
+# this shell, so a value that merely matches our environment must still be
+# passed: every exported variable is un-exported (value kept) before sourcing,
+# and set -a re-exports exactly those the file assigns. The process basics
+# (HOME PATH USER LOGNAME SHELL TMPDIR LANG TERM) stay exported so commands in
+# the file work, and are passed only when the file changes them. Values are
+# never printed. Dies if sourcing fails.
+paseo_env_args() {
+  local kv ok=0
+  PASEO_ENV_ARGS=()
+  [ -n "$LANE_ENV_FILE" ] || return 0
+  while IFS= read -r -d '' kv; do
+    if [ "$kv" = __conductor_env_ok__ ]; then ok=1; continue; fi
+    PASEO_ENV_ARGS+=(--env "$kv")
+  done < <(bash -c '
+    __ac_basic=" HOME PATH USER LOGNAME SHELL TMPDIR LANG TERM "
+    for __ac_v in $(compgen -e); do
+      case $__ac_basic in
+        *" $__ac_v "*) printf -v "__ac_old_$__ac_v" "%s" "${!__ac_v}" ;;
+        *) export -n "$__ac_v" ;;
+      esac
+    done
+    set -a
+    . "$1" >/dev/null || exit 1
+    set +a
+    for __ac_v in $(compgen -e); do
+      case $__ac_v in PWD | OLDPWD | SHLVL | _) continue ;; esac
+      __ac_o="__ac_old_$__ac_v"
+      case $__ac_basic in
+        *" $__ac_v "*) if [ "${!__ac_o}" = "${!__ac_v}" ]; then continue; fi ;;
+      esac
+      printf "%s=%s\0" "$__ac_v" "${!__ac_v}"
+    done
+    printf "%s\0" __conductor_env_ok__' conductor-lane-env "$LANE_ENV_FILE")
+  [ "$ok" -eq 1 ] || die "failed to source LANE_ENV_FILE ($LANE_ENV_FILE)"
+}
+
+# paseo_start_agent <title> <kind> <workspace> <args-string> <role> <prompt>:
+# create the agent in <workspace> with its first prompt (Paseo starts no agent
+# without one), labelled with the run and <role>, plus PASEO_ENV_ARGS. Sets
+# AGENT_HANDLE to its id and PASEO_RUN_STATUS to the status `paseo run` reported.
+paseo_start_agent() {
+  local out
+  local -a argv cmd
+  read -r -a argv <<<"$4"
+  cmd=(paseo run --no-wait --json --provider "$2" --workspace "$3" --title "$1"
+    --label "$PASEO_RUN_LABEL=$RUN_NAME" --label "$PASEO_ROLE_LABEL=$5")
+  if [ ${#PASEO_ENV_ARGS[@]} -gt 0 ]; then cmd+=("${PASEO_ENV_ARGS[@]}"); fi
+  if [ ${#argv[@]} -gt 0 ]; then cmd+=("${argv[@]}"); fi
+  cmd+=("$6")
+  out=$("${cmd[@]}") || die "paseo run failed for agent $1"
+  AGENT_HANDLE=$(printf '%s' "$out" | jq -r '.agentId // empty')
+  PASEO_RUN_STATUS=$(printf '%s' "$out" | jq -r '.status // empty')
+  [ -n "$AGENT_HANDLE" ] || die "could not read agentId from paseo run output"
+}
+
+# paseo_confirm_start <agent> <label>: confirm that the turn of the prompt
+# paseo_start_agent sent began: `paseo run` reported it running, or within 45s
+# the agent is working or its state_change_seq moves. Returns 0 or 5.
+paseo_confirm_start() {
+  local json
+  if [ "$PASEO_RUN_STATUS" = running ]; then
+    LAST_STATE=working
+    printf 'prompted %s: agent %s, turn started\n' "$2" "$1"
+    return 0
+  fi
+  json=$(agents_json) || exit 5
+  confirm_turn "$1" "$(agent_seq "$json" "$1")" "$2"
+}
 
 # ---------------------------------------------------------------------------
 # rendering
@@ -332,19 +514,28 @@ AWK_SHELL_DQ='
 
 # render_file <file> <escape>: replace {{KEY}} placeholders with the RENDER_<KEY>
 # env values; <escape> "shell_dq" escapes them for a double-quoted shell string,
-# "none" inserts them as-is
+# "none" inserts them as-is. A line that is exactly "{{IF <backend>}}" starts a
+# block kept only when RENDER_BACKEND is <backend>; a line "{{END}}" ends it.
+# Both marker lines are dropped.
 render_file() {
   local f=$1 escape=$2 tmp
   tmp="$f.conductor-tmp"
   RENDER_ESCAPE=$escape awk "$AWK_SHELL_DQ"'
     BEGIN {
-      n = split("RUN RUN_NAME CONDUCTOR_HOME REPO AGENT_KIND BASE_REF", k, " ")
+      n = split("RUN RUN_NAME CONDUCTOR_HOME REPO AGENT_KIND BASE_REF BACKEND BACKEND_NAME", k, " ")
       for (i = 1; i <= n; i++) {
         key[i] = "{{" k[i] "}}"
         val[i] = ENVIRON["RENDER_" k[i]]
         if (ENVIRON["RENDER_ESCAPE"] == "shell_dq") val[i] = shell_dq(val[i])
       }
+      skip = 0
     }
+    index($0, "{{IF ") == 1 && substr($0, length($0) - 1) == "}}" {
+      skip = (substr($0, 6, length($0) - 7) != ENVIRON["RENDER_BACKEND"])
+      next
+    }
+    $0 == "{{END}}" { skip = 0; next }
+    skip { next }
     {
       line = $0; out = ""
       while ((p = index(line, "{{")) > 0) {
@@ -367,13 +558,13 @@ render_file() {
   rm -f "$tmp"
 }
 
-# set RUN_NAME/REPO/AGENT_KIND/BASE_REF lines in run.env from SET_* env vars
+# set RUN_NAME/REPO/BACKEND/AGENT_KIND/BASE_REF lines in run.env from SET_* env vars
 set_run_env_keys() {
   local f=$1 tmp
   tmp="$f.conductor-tmp"
   [ -f "$f" ] || : >"$f"
   awk "$AWK_SHELL_DQ"'
-    BEGIN { n = split("RUN_NAME REPO AGENT_KIND BASE_REF", k, " ") }
+    BEGIN { n = split("RUN_NAME REPO BACKEND AGENT_KIND BASE_REF", k, " ") }
     {
       for (i = 1; i <= n; i++) {
         if (index($0, k[i] "=") == 1) {
@@ -396,10 +587,11 @@ set_run_env_keys() {
 # commands
 
 cmd_new() {
-  local name="" repo="" kind="" base="" runs="" top tpl dir f escape start_ref
+  local name="" repo="" backend="" kind="" base="" runs="" top tpl dir f escape start_ref backend_name start_from
   while [ $# -gt 0 ]; do
     case $1 in
       --repo) require_optval "$@"; repo=$2; shift 2 ;;
+      --backend) require_optval "$@"; backend=$2; shift 2 ;;
       --kind) require_optval "$@"; kind=$2; shift 2 ;;
       --base) require_optval "$@"; base=$2; shift 2 ;;
       --runs-dir) require_optval "$@"; runs=$2; shift 2 ;;
@@ -412,8 +604,22 @@ cmd_new() {
   [ -n "$name" ] || usage_err "new: missing <name>"
   case $name in . | .. | *[!A-Za-z0-9._-]*) usage_err "new: invalid run name '$name' (expected [A-Za-z0-9._-]+)" ;; esac
   [ -n "$repo" ] || usage_err "new: --repo <path> is required"
+  backend=${backend:-herdr}
   kind=${kind:-claude}
-  case $kind in *[!A-Za-z0-9_-]*) usage_err "new: invalid --kind '$kind'" ;; esac
+  case $backend in
+    herdr)
+      backend_name=Herdr
+      start_from="from a Herdr pane"
+      case $kind in *[!A-Za-z0-9_-]*) usage_err "new: invalid --kind '$kind'" ;; esac
+      ;;
+    paseo)
+      backend_name=Paseo
+      start_from="from any shell that reaches the Paseo daemon"
+      # Paseo provider or provider/model, e.g. claude, codex/gpt-5.4, omp/anthropic/claude-opus-5-5
+      case $kind in "" | /* | */ | *[!A-Za-z0-9._/-]*) usage_err "new: invalid --kind '$kind'" ;; esac
+      ;;
+    *) usage_err "new: --backend must be herdr or paseo" ;;
+  esac
   base=${base:-origin/main}
   case $base in *[[:space:]]*) usage_err "new: invalid --base '$base'" ;; esac
   require_cmd git
@@ -432,14 +638,15 @@ cmd_new() {
   mkdir -p "$dir/out" "$dir/wt"
 
   export RENDER_RUN="$dir" RENDER_RUN_NAME="$name" RENDER_CONDUCTOR_HOME="$CONDUCTOR_HOME" \
-    RENDER_REPO="$top" RENDER_AGENT_KIND="$kind" RENDER_BASE_REF="$base"
+    RENDER_REPO="$top" RENDER_AGENT_KIND="$kind" RENDER_BASE_REF="$base" \
+    RENDER_BACKEND="$backend" RENDER_BACKEND_NAME="$backend_name"
   while IFS= read -r -d '' f; do
     grep -qI -F '{{' "$f" 2>/dev/null || continue
     escape=none
     if [ "$f" = "$dir/run.env" ]; then escape=shell_dq; fi
     render_file "$f" "$escape"
   done < <(find "$dir" -type f -print0)
-  export SET_RUN_NAME="$name" SET_REPO="$top" SET_AGENT_KIND="$kind" SET_BASE_REF="$base"
+  export SET_RUN_NAME="$name" SET_REPO="$top" SET_BACKEND="$backend" SET_AGENT_KIND="$kind" SET_BASE_REF="$base"
   set_run_env_keys "$dir/run.env"
 
   if [ "$runs" = "$(default_runs_dir)" ]; then start_ref=$name; else start_ref=$dir; fi
@@ -447,20 +654,21 @@ cmd_new() {
 created run $name
   dir:  $dir
   repo: $top
-  kind: $kind   base: $base
+  backend: $backend   kind: $kind   base: $base
 next:
   1. edit $dir/run.env (AGENT_ARGS, INSTALL_CMD, GATES, DEV_CMD/DEV_PORT, COPY_FILES, LANE_ENV_FILE)
   2. write one lane prompt per lane in $dir/lanes/ (e.g. L1-<slug>.md, see L1-example.md)
   3. write ticket specs in $dir/specs/SPECS.md
-  4. from a Herdr pane: $CONDUCTOR_HOME/bin/conductor start $start_ref
+  4. $start_from: $CONDUCTOR_HOME/bin/conductor start $start_ref
 EOF
 }
 
 cmd_start() {
-  local runarg="" pane="" kind="" prompt_only=0 args_set=0 rc=0 name json prompt retry_cmd
+  local runarg="" pane="" workspace="" kind="" prompt_only=0 args_set=0 rc=0 name json prompt retry_cmd handle
   while [ $# -gt 0 ]; do
     case $1 in
       --pane) require_optval "$@"; pane=$2; shift 2 ;;
+      --workspace) require_optval "$@"; workspace=$2; shift 2 ;;
       --kind) require_optval "$@"; kind=$2; shift 2 ;;
       --prompt-only) prompt_only=1; shift ;;
       -*) usage_err "start: unknown option $1" ;;
@@ -469,30 +677,46 @@ cmd_start() {
         runarg=$1; shift ;;
     esac
   done
-  if [ "$prompt_only" -eq 1 ] && { [ -n "$pane" ] || [ -n "$kind" ]; }; then
-    usage_err "start: --prompt-only cannot be combined with --pane or --kind"
+  if [ "$prompt_only" -eq 1 ] && { [ -n "$pane" ] || [ -n "$workspace" ] || [ -n "$kind" ]; }; then
+    usage_err "start: --prompt-only cannot be combined with --pane, --workspace or --kind"
   fi
   load_run "$runarg"
-  herdr_preflight
+  case $BACKEND in
+    herdr) [ -z "$workspace" ] || usage_err "start: --workspace needs BACKEND=paseo (use --pane with herdr)" ;;
+    paseo) [ -z "$pane" ] || usage_err "start: --pane needs BACKEND=herdr (use --workspace with paseo)" ;;
+  esac
+  backend_preflight
   [ -f "$RUN/CONDUCTOR.md" ] || die "missing $RUN/CONDUCTOR.md"
   name="$RUN_NAME-conductor"
   prompt="Read $RUN/CONDUCTOR.md and follow it exactly."
   retry_cmd="conductor start $RUN --prompt-only"
   json=$(agents_json)
+  handle=$(agent_lookup "$json" "$name")
   if [ "$prompt_only" -eq 1 ]; then
-    [ "$(agent_state "$json" "$name")" != gone ] ||
-      die "conductor agent $name is gone; not prompting (start it with: conductor start $RUN)"
-    pane=$(agent_pane "$json" "$name")
+    [ -n "$handle" ] || die "conductor agent $name is gone; not prompting (start it with: conductor start $RUN)"
+    pane=$(agent_pane "$json" "$handle")
     pane=${pane:-unknown}
-    prompt_confirmed "$name" "$prompt" conductor "$retry_cmd" || rc=$?
-    finish_prompt "$rc" existing "$name" "$pane" conductor "$retry_cmd"
-    printf 'agent: %s\npane: %s\n' "$name" "$pane"
+    prompt_confirmed "$handle" "$prompt" conductor "$retry_cmd" || rc=$?
+    finish_prompt "$rc" existing "$handle" "$pane" conductor "$retry_cmd"
+    printf 'agent: %s\n' "$handle"
+    if [ "$BACKEND" = herdr ]; then printf 'pane: %s\n' "$pane"; fi
     return 0
   fi
-  [ "$(agent_state "$json" "$name")" = gone ] || die "herdr agent '$name' already exists (see herdr agent list)"
+  [ -z "$handle" ] || die "$(agent_exists_msg "$name" "$handle")"
   [ -z "$CONDUCTOR_ARGS" ] || args_set=1
   resolve_harness "${kind:-$CONDUCTOR_KIND}" "$CONDUCTOR_ARGS" "$args_set" || true
   mkdir -p "$RUN/out"
+  if [ "$BACKEND" = paseo ]; then
+    if [ -z "$workspace" ]; then workspace=$(paseo_create_workspace_local "$name"); fi
+    PASEO_ENV_ARGS=()
+    DIE_HINT="workspace $workspace was created for the conductor; reuse it with: conductor start $RUN --workspace $workspace"
+    paseo_start_agent "$name" "$HARNESS_KIND" "$workspace" "$HARNESS_ARGS" conductor "$prompt"
+    DIE_HINT="the conductor prompt was already sent to $AGENT_HANDLE; inspect $(agent_read_cmd "$AGENT_HANDLE") before re-running $retry_cmd"
+    paseo_confirm_start "$AGENT_HANDLE" conductor || rc=$?
+    printf 'agent: %s\nworkspace: %s\n' "$AGENT_HANDLE" "$workspace"
+    finish_prompt "$rc" started "$AGENT_HANDLE" - conductor "$retry_cmd"
+    return 0
+  fi
   if [ -z "$pane" ]; then pane=$(split_pane "$REPO"); fi
   start_agent "$name" "$HARNESS_KIND" "$pane" "$HARNESS_ARGS"
   prompt_if_ready "$name" "$prompt" conductor "$retry_cmd" \
@@ -519,10 +743,12 @@ find_lane_file() {
   printf '%s' "$found"
 }
 
-# lane_prompt <LANE> <lane-file> <worktree>: the standard lane prompt
+# lane_prompt <LANE> <lane-file> <worktree> <workspace>: the standard lane prompt;
+# under Paseo it also names the lane's workspace (for its dev-server terminal)
 lane_prompt() {
   printf 'Read %s/LANE_RULES.md first, then %s, and run lane %s until you can reply LANE DONE. Your lane worktree is %s.' \
     "$RUN" "$2" "$1" "$3"
+  if [ "$BACKEND" = paseo ]; then printf ' Your Paseo workspace is %s.' "$4"; fi
 }
 
 # prompt_lane_cmd <LANE>: the command that (re)sends the lane prompt
@@ -534,7 +760,7 @@ prompt_lane_cmd() { printf 'conductor prompt-lane %s %s' "$RUN" "$1"; }
 # settle_agent <name>: true once the agent is idle or done on two consecutive checks
 # ~2s apart within 30s; false otherwise (fails at once if it is gone). Sets
 # LAST_STATE to the last observed state. Callers use it with ||, which disables
-# set -e here, so herdr failures exit explicitly (agents_json already reported).
+# set -e here, so backend failures exit explicitly (agents_json already reported).
 settle_agent() {
   local name=$1 t=0 hits=0 json
   LAST_STATE=""
@@ -563,12 +789,21 @@ settle_agent() {
 # sent); 5 when the prompt was sent but no turn was confirmed. LAST_STATE holds
 # the last observed state. Once the prompt is sent, every failure exits 5.
 prompt_confirmed() {
-  local agent=$1 prompt=$2 label=$3 retry_label=$4 t=0 json seq cur
+  local agent=$1 prompt=$2 label=$3 retry_label=$4 json seq
   settle_agent "$agent" || return 4
   json=$(agents_json) || exit 1
   seq=$(agent_seq "$json" "$agent")
-  herdr agent prompt "$agent" "$prompt" >/dev/null || die "herdr agent prompt $agent failed"
+  send_prompt "$agent" "$prompt" || die "sending the prompt to agent $agent failed"
   DIE_HINT="the ${label%% *} prompt was already sent to $agent; inspect $(agent_read_cmd "$agent") before re-running $retry_label"
+  confirm_turn "$agent" "$seq" "$label"
+}
+
+# confirm_turn <agent> <baseline-seq> <label>: after a prompt was sent, wait up
+# to 45s for its turn: state working, or state_change_seq moved off
+# <baseline-seq>. Returns 0 (and says so) or 5; LAST_STATE holds the last
+# observed state. Every failure exits 5.
+confirm_turn() {
+  local agent=$1 seq=$2 label=$3 t=0 json cur
   while :; do
     sleep 2
     t=$((t + 2))
@@ -627,10 +862,16 @@ finish_prompt() {
     5)
       {
         printf "conductor: %s: prompt sent to agent %s but no turn started within 45s (state '%s'); not resending\n" "$label" "$agent" "$LAST_STATE"
-        printf 'conductor: pane: %s\n' "$pane"
-        printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$agent")"
-        printf 'conductor: if the prompt text sits unsent in the input box, press Enter: herdr agent send-keys %s enter\n' "$agent"
-        printf 'conductor: if the input box is empty, re-run: %s\n' "$retry_cmd"
+        if [ "$BACKEND" = herdr ]; then
+          printf 'conductor: pane: %s\n' "$pane"
+          printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$agent")"
+          printf 'conductor: if the prompt text sits unsent in the input box, press Enter: herdr agent send-keys %s enter\n' "$agent"
+          printf 'conductor: if the input box is empty, re-run: %s\n' "$retry_cmd"
+        else
+          printf 'conductor: inspect: %s\n' "$(agent_read_cmd "$agent")"
+          printf 'conductor: if the timeline shows the prompt (a [Message received] entry) the agent has it; check again with conductor status\n'
+          printf 'conductor: if the timeline does not show the prompt, re-run: %s\n' "$retry_cmd"
+        fi
       } >&2
       exit 5
       ;;
@@ -690,10 +931,24 @@ check_env_file_for_pane() {
   case $LANE_ENV_FILE in *"'"* | *\\*) die "LANE_ENV_FILE path must not contain quotes or backslashes" ;; esac
 }
 
-# create_lane_workspace <agent> <branch> <base>: create the lane's Herdr worktree
-# workspace; sets LANE_WS, LANE_PANE, LANE_WT
+# create_lane_workspace <agent> <branch> <base>: create the lane's worktree
+# workspace (Herdr, or Paseo with <agent> as worktree slug and title); sets
+# LANE_WS, LANE_PANE (Herdr root pane; "-" under Paseo), LANE_WT
 create_lane_workspace() {
   local out
+  if [ "$BACKEND" = paseo ]; then
+    out=$(paseo workspace create --isolation worktree --path "$REPO" --mode branch-off \
+      --new-branch "$2" --base "$3" --worktree-slug "$1" --title "$1" --json) ||
+      die "paseo workspace create failed for branch $2"
+    LANE_WS=$(printf '%s' "$out" | jq -r '.workspaceId // empty')
+    LANE_WT=$(printf '%s' "$out" | jq -r '.cwd // empty')
+    LANE_PANE=-
+    if [ -z "$LANE_WS" ] || [ -z "$LANE_WT" ]; then
+      die "could not read workspaceId/cwd from paseo workspace create output"
+    fi
+    printf 'workspace: %s\nworktree: %s\n' "$LANE_WS" "$LANE_WT"
+    return 0
+  fi
   out=$(herdr worktree create --cwd "$REPO" --branch "$2" --base "$3" --label "$1" --no-focus) ||
     die "herdr worktree create failed for branch $2"
   LANE_WS=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty')
@@ -726,14 +981,31 @@ start_lane_agent() {
   start_agent "$agent" "$HARNESS_KIND" "$LANE_PANE" "$HARNESS_ARGS"
   DIE_HINT=""
   lane_row_write "$lane" "$agent" "$HARNESS_KIND" "$LANE_WS" "$LANE_PANE" "$LANE_WT" "$4" "$5" "$(utc_now)"
-  prompt_if_ready "$agent" "$(lane_prompt "$lane" "$lane_file" "$LANE_WT")" "lane $lane" prompt-lane \
+  prompt_if_ready "$agent" "$(lane_prompt "$lane" "$lane_file" "$LANE_WT" "$LANE_WS")" "lane $lane" prompt-lane \
     "lane $lane is in $LANES_TSV but its prompt was not sent; retry: $retry_cmd" || rc=$?
   printf '%s\n' "$LANE_ROW"
   finish_prompt "$rc" started "$agent" "$LANE_PANE" "lane $lane" "$retry_cmd"
 }
 
+# paseo_start_lane_agent <LANE> <title> <lane-file> <branch> <base>: create the
+# lane's Paseo agent in LANE_WS with its lane prompt and PASEO_ENV_ARGS, clear
+# the partial-setup DIE_HINT, append its lanes.tsv row (agent = Paseo agent id,
+# pane = "-"), confirm the turn, print the row; exits 5 per finish_prompt
+paseo_start_lane_agent() {
+  local lane=$1 title=$2 lane_file=$3 retry_cmd rc=0
+  retry_cmd=$(prompt_lane_cmd "$lane")
+  paseo_start_agent "$title" "$HARNESS_KIND" "$LANE_WS" "$HARNESS_ARGS" "$lane" \
+    "$(lane_prompt "$lane" "$lane_file" "$LANE_WT" "$LANE_WS")"
+  DIE_HINT=""
+  lane_row_write "$lane" "$AGENT_HANDLE" "$HARNESS_KIND" "$LANE_WS" - "$LANE_WT" "$4" "$5" "$(utc_now)"
+  DIE_HINT="the lane prompt was already sent to $AGENT_HANDLE; inspect $(agent_read_cmd "$AGENT_HANDLE") before re-running prompt-lane"
+  paseo_confirm_start "$AGENT_HANDLE" "lane $lane" || rc=$?
+  printf '%s\n' "$LANE_ROW"
+  finish_prompt "$rc" started "$AGENT_HANDLE" - "lane $lane" "$retry_cmd"
+}
+
 cmd_launch_lane() {
-  local runarg="" lane="" branch="" base="" kind="" args="" args_set=0 lane_file name json
+  local runarg="" lane="" branch="" base="" kind="" args="" args_set=0 lane_file name json existing
   while [ $# -gt 0 ]; do
     case $1 in
       --branch) require_optval "$@"; branch=$2; shift 2 ;;
@@ -753,12 +1025,13 @@ cmd_launch_lane() {
   fi
   check_lane_id "$lane"
   load_run "$runarg"
-  herdr_preflight
+  backend_preflight
   require_cmd git
   lane_file=$(find_lane_file "$lane")
   name=$(agent_name "$RUN_NAME-$lane")
   json=$(agents_json)
-  [ "$(agent_state "$json" "$name")" = gone ] || die "herdr agent '$name' already exists (see herdr agent list)"
+  existing=$(agent_lookup "$json" "$name")
+  [ -z "$existing" ] || die "$(agent_exists_msg "$name" "$existing")"
 
   branch=${branch:-lane/$lane}
   base=${base:-$BASE_REF}
@@ -767,13 +1040,17 @@ cmd_launch_lane() {
   branch_exists "$branch" && die "branch already exists in $REPO: $branch"
   check_base "$base"
   check_env_file
-  check_env_file_for_pane
+  if [ "$BACKEND" = paseo ]; then paseo_env_args; else check_env_file_for_pane; fi
 
   create_lane_workspace "$name" "$branch" "$base"
   DIE_HINT="lane $lane left partially set up: workspace $LANE_WS, pane $LANE_PANE, worktree $LANE_WT, branch $branch"
   mkdir -p "$RUN/out/$lane"
   copy_files "$LANE_WT"
   run_install "$LANE_WT" "$RUN/out/$lane/install.log"
+  if [ "$BACKEND" = paseo ]; then
+    paseo_start_lane_agent "$lane" "$name" "$lane_file" "$branch" "$base"
+    return 0
+  fi
   export_env_file_into_pane "$LANE_PANE"
   start_lane_agent "$lane" "$name" "$lane_file" "$branch" "$base"
 }
@@ -783,7 +1060,7 @@ cmd_prompt_lane() {
   [ $# -eq 2 ] || usage_err "prompt-lane: usage: conductor prompt-lane <run> <LANE>"
   check_lane_id "$lane"
   load_run "$runarg"
-  herdr_preflight
+  backend_preflight
   [ -s "$LANES_TSV" ] || die "no lanes launched yet ($LANES_TSV missing)"
   lane_row_find "$lane" || die "lane $lane has no row in $LANES_TSV (launch it with conductor launch-lane)"
   agent=$ROW_AGENT pane=$ROW_PANE wt=$ROW_WORKTREE
@@ -793,7 +1070,7 @@ cmd_prompt_lane() {
   # keypress is absorbed by the settle step in prompt_confirmed.
   json=$(agents_json)
   [ "$(agent_state "$json" "$agent")" != gone ] || die "agent $agent for lane $lane is gone; not prompting"
-  prompt_confirmed "$agent" "$(lane_prompt "$lane" "$lane_file" "$wt")" "lane $lane" prompt-lane || rc=$?
+  prompt_confirmed "$agent" "$(lane_prompt "$lane" "$lane_file" "$wt" "$ROW_WORKSPACE")" "lane $lane" prompt-lane || rc=$?
   finish_prompt "$rc" existing "$agent" "$pane" "lane $lane" "$(prompt_lane_cmd "$lane")"
 }
 
@@ -1015,7 +1292,7 @@ cmd_status() {
   local runarg=${1:-}
   [ $# -le 1 ] || usage_err "status: usage: conductor status <run>"
   load_run "$runarg"
-  herdr_preflight
+  backend_preflight
   print_report "$(agents_json)"
 }
 
@@ -1035,7 +1312,7 @@ cmd_watch() {
     esac
   done
   load_run "$runarg"
-  herdr_preflight
+  backend_preflight
   [ -s "$LANES_TSV" ] || die "no lanes launched yet ($LANES_TSV missing)"
   # Each lane's baseline state_change_seq is taken when watch first sees it, so a
   # lane still idle from before its prompt (not yet picked up) does not count as
